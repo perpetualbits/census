@@ -21,6 +21,9 @@ pub struct ServerConfig {
     pub start_tls: bool,
     pub base_dn: String,
     pub bind_dn: Option<String>,
+    /// Shell command whose stdout is the bind password (e.g. `rbw get "My LDAP"`).
+    /// Preferred over CENSUS_BIND_PASSWORD env var; both beat interactive prompt.
+    pub password_cmd: Option<String>,
     pub sni: Option<String>,
     #[serde(default = "default_true")]
     pub verify: bool,

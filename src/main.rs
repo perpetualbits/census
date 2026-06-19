@@ -71,8 +71,28 @@ fn get_password(cfg: &Config) -> Option<String> {
     if cfg.server.bind_dn.is_none() {
         return None;
     }
+    // 1. password_cmd in config (e.g. rbw get "...")
+    if let Some(cmd) = &cfg.server.password_cmd {
+        match run_password_cmd(cmd) {
+            Ok(pw) => return Some(pw),
+            Err(e) => eprintln!("Warning: password_cmd failed: {e}"),
+        }
+    }
+    // 2. Environment variable
     if let Ok(pw) = std::env::var("CENSUS_BIND_PASSWORD") {
         return Some(pw);
     }
+    // 3. Interactive prompt
     rpassword::prompt_password("LDAP bind password: ").ok()
+}
+
+fn run_password_cmd(cmd: &str) -> anyhow::Result<String> {
+    let out = std::process::Command::new("sh")
+        .args(["-c", cmd])
+        .output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("exited {}: {}", out.status, err.trim());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
