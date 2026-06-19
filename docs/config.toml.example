@@ -1,0 +1,29 @@
+# Census LDAP admin tool — configuration template
+#
+# Copy to ~/.config/census/config.toml and fill in your real values.
+# Keep that file out of version control.
+#
+# Password is NEVER stored here.
+# Set env var:  export CENSUS_BIND_PASSWORD="secret"
+# Or census will prompt interactively on startup.
+
+[server]
+host      = "ldap.example.com"        # LDAP server hostname
+port      = 636
+use_ssl   = true                       # true → LDAPS  (port 636 typically)
+start_tls = false                      # true → plain LDAP + STARTTLS (port 389)
+base_dn   = "dc=example,dc=com"
+bind_dn   = "cn=admin,dc=example,dc=com"
+# sni     = "ldap.example.com"        # TLS SNI override (default: host)
+verify    = true                       # require valid TLS certificate
+
+[tunnel]
+# SSH local-forward tunnel.  census will reuse an existing -L forward if one
+# is already running, or spawn a new one with ssh -N -L.
+enabled     = false
+ssh_alias   = "jump.example.com"       # SSH alias from ~/.ssh/config
+remote_host = "ldap.example.com"       # LDAP host as seen from the SSH server
+remote_port = 636
+
+[display]
+# allow_writes = false    # require --write flag to perform any modifications
