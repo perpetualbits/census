@@ -2,14 +2,16 @@ use anyhow::Context;
 use ldap3::{LdapConn, LdapConnSettings, Mod, Scope, SearchEntry};
 use std::collections::{HashMap, HashSet};
 
-use crate::config::{Config, TunnelConfig};
+use crate::config::{Config, PwScheme, TunnelConfig};
 use crate::schema::Schema;
+use super::password::crypt_sha512;
 use super::tunnel::{self, Tunnel};
 
 pub struct LdapClient {
     conn: LdapConn,
     pub base_dn: String,
     schema: Schema,
+    password_scheme: PwScheme,
     _tunnel: Option<Tunnel>,
 }
 
@@ -73,6 +75,7 @@ impl LdapClient {
             conn,
             base_dn: cfg.server.base_dn.clone(),
             schema: Schema::rfc2307(),
+            password_scheme: cfg.server.password_scheme,
             _tunnel: tun,
         })
     }
@@ -247,6 +250,31 @@ impl LdapClient {
         }
         let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
         self.modify_replace(dn, attr, &refs)
+    }
+
+    /// Set a user's password using the configured scheme: the server-side RFC
+    /// 3062 Password Modify exop (default) or client-side `{CRYPT}$6$`.
+    pub fn set_password(&mut self, dn: &str, plaintext: &str) -> anyhow::Result<()> {
+        match self.password_scheme {
+            PwScheme::Exop => {
+                use ldap3::exop::PasswordModify;
+                let req = PasswordModify {
+                    user_id: Some(dn),
+                    old_pass: None,
+                    new_pass: Some(plaintext),
+                };
+                self.conn
+                    .extended(req)
+                    .context("Password modify exop failed")?
+                    .success()
+                    .context("Password modify exop rejected")?;
+                Ok(())
+            }
+            PwScheme::Crypt => {
+                let hashed = crypt_sha512(plaintext)?;
+                self.modify_replace(dn, "userPassword", &[&hashed])
+            }
+        }
     }
 
     pub fn close(mut self) -> anyhow::Result<()> {

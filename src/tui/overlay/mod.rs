@@ -8,12 +8,14 @@
 pub mod confirm;
 pub mod input;
 pub mod keys;
+pub mod passwd;
 
 use mullion::{Buffer, KeyCode, KeyModifiers, Rect};
 
 pub use confirm::ConfirmDialog;
 pub use input::InputDialog;
 pub use keys::KeyEditor;
+pub use passwd::PasswdDialog;
 
 /// A write the user has requested. The app gates and executes these centrally.
 #[derive(Clone)]
@@ -26,6 +28,8 @@ pub enum Action {
     AddMember { group_dn: String, uid: String, group: String },
     /// Remove a user from a group's membership.
     DelMember { group_dn: String, uid: String, group: String },
+    /// Set a user's password (plaintext; the client hashes per config).
+    SetPasswd { dn: String, plaintext: String },
 }
 
 /// What a modal asks the app to do after a keystroke.
@@ -43,6 +47,7 @@ pub enum Overlay {
     Input(InputDialog),
     Keys(KeyEditor),
     Confirm(ConfirmDialog),
+    Passwd(PasswdDialog),
 }
 
 impl Overlay {
@@ -51,6 +56,7 @@ impl Overlay {
             Overlay::Input(d)   => d.handle_key(key, mods),
             Overlay::Keys(d)    => d.handle_key(key, mods),
             Overlay::Confirm(d) => d.handle_key(key, mods),
+            Overlay::Passwd(d)  => d.handle_key(key, mods),
         }
     }
 
@@ -59,6 +65,7 @@ impl Overlay {
             Overlay::Input(d)   => d.render(buf, area),
             Overlay::Keys(d)    => d.render(buf, area),
             Overlay::Confirm(d) => d.render(buf, area),
+            Overlay::Passwd(d)  => d.render(buf, area),
         }
     }
 }

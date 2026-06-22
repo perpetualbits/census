@@ -238,6 +238,7 @@ fn handle_key(
             }
             (Pane::Right, Char('e')) => open_attr_edit(app),
             (Pane::Right, Char('K')) => open_key_editor(app),
+            (Pane::Right, Char('p')) => open_passwd(app),
             _ => {}
         },
 
@@ -333,6 +334,17 @@ fn open_key_editor(app: &mut App) {
     app.overlay = Some(Overlay::Keys(editor));
 }
 
+/// Open the set-password dialog for the cursored user.
+fn open_passwd(app: &mut App) {
+    if !app.write_mode {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let Some(user) = app.detail() else { return; };
+    let dlg = overlay::PasswdDialog::new(user.dn.clone(), user.uid.clone());
+    app.overlay = Some(Overlay::Passwd(dlg));
+}
+
 // ─── write chokepoint ─────────────────────────────────────────────────────────
 
 /// Execute a committed [`Action`]. The single place writes happen: gated on
@@ -387,6 +399,12 @@ fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
                     app.status = Some((format!("Removed {uid} from {group}"), false));
                 }
                 Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            }
+        }
+        Action::SetPasswd { dn, plaintext } => {
+            match app.session_mut().client.set_password(&dn, &plaintext) {
+                Ok(())  => { app.status = Some(("Password updated".into(), false)); }
+                Err(e)  => { app.status = Some((format!("Error: {e}"), true)); }
             }
         }
     }

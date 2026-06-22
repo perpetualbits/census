@@ -30,6 +30,21 @@ pub struct ServerConfig {
     pub sni: Option<String>,
     #[serde(default = "default_true")]
     pub verify: bool,
+    /// How password changes are written: server-side RFC 3062 exop (default,
+    /// honours the server's password policy) or client-side `{CRYPT}$6$`.
+    #[serde(default)]
+    pub password_scheme: PwScheme,
+}
+
+/// Strategy for writing a user's password.
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PwScheme {
+    /// RFC 3062 Password Modify extended operation (server hashes per policy).
+    #[default]
+    Exop,
+    /// Client-side SHA-512 crypt stored as `userPassword: {CRYPT}$6$…`.
+    Crypt,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
