@@ -351,6 +351,49 @@ impl LdapClient {
         Ok(dn)
     }
 
+    /// Lowest free gidNumber above the current maximum (floored at 10000).
+    pub fn next_gid_number(&mut self) -> anyhow::Result<u32> {
+        let base   = self.schema.group_base(&self.base_dn);
+        let filter = self.schema.group_filter;
+        let attr   = self.schema.gid_number;
+        let (rs, _) = self.conn
+            .search(&base, Scope::OneLevel, filter, vec![attr])
+            .context("gidNumber scan failed")?
+            .success()
+            .context("gidNumber scan rejected")?;
+        let max = rs.into_iter()
+            .filter_map(|e| {
+                SearchEntry::construct(e).attrs.get(attr)
+                    .and_then(|v| v.first())
+                    .and_then(|s| s.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(9999);
+        Ok(max.max(9999) + 1)
+    }
+
+    /// Create a posixGroup with the given name, gidNumber, and initial members.
+    /// Returns the new entry's DN.
+    pub fn add_group(&mut self, name: &str, gid_number: u32, members: &[String]) -> anyhow::Result<String> {
+        let s = self.schema.clone();
+        let dn = format!("{}={},{},{}", s.cn, name, s.group_ou, self.base_dn);
+        let one = |v: String| -> HashSet<String> { HashSet::from([v]) };
+        let mut attrs: Vec<(String, HashSet<String>)> = vec![
+            ("objectClass".into(), HashSet::from(["top".to_string(), "posixGroup".to_string()])),
+            (s.cn.into(),         one(name.to_string())),
+            (s.gid_number.into(), one(gid_number.to_string())),
+        ];
+        if !members.is_empty() {
+            attrs.push((s.member.into(), members.iter().cloned().collect()));
+        }
+        self.conn
+            .add(&dn, attrs)
+            .context("Add group failed")?
+            .success()
+            .context("Add group rejected")?;
+        Ok(dn)
+    }
+
     /// Delete an entry by DN.
     pub fn delete_entry(&mut self, dn: &str) -> anyhow::Result<()> {
         self.conn

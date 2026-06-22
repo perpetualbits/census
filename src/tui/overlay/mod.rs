@@ -8,6 +8,7 @@
 pub mod confirm;
 pub mod input;
 pub mod keys;
+pub mod newgroup;
 pub mod newuser;
 pub mod passwd;
 
@@ -16,6 +17,7 @@ use mullion::{Buffer, KeyCode, KeyModifiers, Rect};
 pub use confirm::ConfirmDialog;
 pub use input::InputDialog;
 pub use keys::KeyEditor;
+pub use newgroup::NewGroupForm;
 pub use newuser::NewUserForm;
 pub use passwd::PasswdDialog;
 
@@ -36,8 +38,12 @@ pub enum Action {
     SetPasswd { dn: String, plaintext: String },
     /// Create a new user entry.
     CreateUser(NewUserSpec),
-    /// Delete an entry by DN (`label` is shown in status messages).
+    /// Delete a user entry by DN (`label` is shown in status messages).
     DeleteEntry { dn: String, label: String },
+    /// Create a new posixGroup.
+    CreateGroup { name: String, gid_number: u32 },
+    /// Delete a group entry by DN.
+    DeleteGroup { dn: String, name: String },
 }
 
 /// What a modal asks the app to do after a keystroke.
@@ -57,26 +63,29 @@ pub enum Overlay {
     Confirm(ConfirmDialog),
     Passwd(PasswdDialog),
     NewUser(NewUserForm),
+    NewGroup(NewGroupForm),
 }
 
 impl Overlay {
     pub fn handle_key(&mut self, key: KeyCode, mods: KeyModifiers) -> OverlayResult {
         match self {
-            Overlay::Input(d)   => d.handle_key(key, mods),
-            Overlay::Keys(d)    => d.handle_key(key, mods),
-            Overlay::Confirm(d) => d.handle_key(key, mods),
-            Overlay::Passwd(d)  => d.handle_key(key, mods),
-            Overlay::NewUser(d) => d.handle_key(key, mods),
+            Overlay::Input(d)    => d.handle_key(key, mods),
+            Overlay::Keys(d)     => d.handle_key(key, mods),
+            Overlay::Confirm(d)  => d.handle_key(key, mods),
+            Overlay::Passwd(d)   => d.handle_key(key, mods),
+            Overlay::NewUser(d)  => d.handle_key(key, mods),
+            Overlay::NewGroup(d) => d.handle_key(key, mods),
         }
     }
 
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         match self {
-            Overlay::Input(d)   => d.render(buf, area),
-            Overlay::Keys(d)    => d.render(buf, area),
-            Overlay::Confirm(d) => d.render(buf, area),
-            Overlay::Passwd(d)  => d.render(buf, area),
-            Overlay::NewUser(d) => d.render(buf, area),
+            Overlay::Input(d)    => d.render(buf, area),
+            Overlay::Keys(d)     => d.render(buf, area),
+            Overlay::Confirm(d)  => d.render(buf, area),
+            Overlay::Passwd(d)   => d.render(buf, area),
+            Overlay::NewUser(d)  => d.render(buf, area),
+            Overlay::NewGroup(d) => d.render(buf, area),
         }
     }
 }

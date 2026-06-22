@@ -251,6 +251,8 @@ fn handle_key(
             Esc => { app.mode = Mode::Browse; }
             Up   | Char('k') => app.groups_cur.up(),
             Down | Char('j') => app.groups_cur.down(app.groups().len()),
+            Char('n') => open_new_group(app),
+            Char('D') => open_delete_group(app),
             Enter => {
                 app.selected_group = app.groups_cur.cursor;
                 app.mode = Mode::Membership;
@@ -374,6 +376,30 @@ fn open_delete_user(app: &mut App) {
     app.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::typed_dn(prompt, dn, action)));
 }
 
+/// Open the new-group form, seeded with the next free gidNumber.
+fn open_new_group(app: &mut App) {
+    if !app.write_mode {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let suggested = app.session_mut().client.next_gid_number().unwrap_or(10000);
+    app.overlay = Some(Overlay::NewGroup(overlay::NewGroupForm::new(suggested)));
+}
+
+/// Open a typed-DN delete confirmation for the group under the cursor.
+fn open_delete_group(app: &mut App) {
+    if !app.write_mode {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let Some(group) = app.groups().get(app.groups_cur.cursor) else { return; };
+    let dn   = group.dn.clone();
+    let name = group.name.clone();
+    let prompt = format!("Delete group {name}? Irreversible.");
+    let action = Action::DeleteGroup { dn: dn.clone(), name };
+    app.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::typed_dn(prompt, dn, action)));
+}
+
 // ─── write chokepoint ─────────────────────────────────────────────────────────
 
 /// Execute a committed [`Action`]. The single place writes happen: gated on
@@ -457,6 +483,26 @@ fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
                 Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
             }
         }
+        Action::CreateGroup { name, gid_number } => {
+            match app.session_mut().client.add_group(&name, gid_number, &[]) {
+                Ok(_dn) => {
+                    app.session_mut().refresh_groups()?;
+                    app.select_group(&name);
+                    app.status = Some((format!("Created group {name}"), false));
+                }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            }
+        }
+        Action::DeleteGroup { dn, name } => {
+            match app.session_mut().client.delete_entry(&dn) {
+                Ok(()) => {
+                    app.session_mut().refresh_groups()?;
+                    app.groups_cur.clamp(app.groups().len());
+                    app.status = Some((format!("Deleted group {name}"), false));
+                }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            }
+        }
     }
     Ok(())
 }
@@ -488,6 +534,13 @@ impl App {
         self.users_cur.clamp(len);
         self.detail = None;
         self.ensure_detail_loaded();
+    }
+
+    /// Move the group cursor to the group named `name` (if present).
+    fn select_group(&mut self, name: &str) {
+        if let Some(i) = self.groups().iter().position(|g| g.name == name) {
+            self.groups_cur.cursor = i;
+        }
     }
 }
 
