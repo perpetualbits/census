@@ -232,6 +232,12 @@ fn handle_key(
         return Ok(false);
     }
 
+    // `?` opens the manual from any screen.
+    if key == Char('?') {
+        app.overlay = Some(Overlay::Help(overlay::HelpView::new()));
+        return Ok(false);
+    }
+
     app.status = None;
 
     match app.mode {

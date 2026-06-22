@@ -6,6 +6,7 @@
 //! gate). Overlays never touch the `LdapClient` themselves.
 
 pub mod confirm;
+pub mod help;
 pub mod input;
 pub mod keys;
 pub mod newgroup;
@@ -15,6 +16,7 @@ pub mod passwd;
 use mullion::{Buffer, KeyCode, KeyModifiers, Rect};
 
 pub use confirm::ConfirmDialog;
+pub use help::HelpView;
 pub use input::InputDialog;
 pub use keys::KeyEditor;
 pub use newgroup::NewGroupForm;
@@ -64,6 +66,7 @@ pub enum Overlay {
     Passwd(PasswdDialog),
     NewUser(NewUserForm),
     NewGroup(NewGroupForm),
+    Help(HelpView),
 }
 
 impl Overlay {
@@ -75,6 +78,7 @@ impl Overlay {
             Overlay::Passwd(d)   => d.handle_key(key, mods),
             Overlay::NewUser(d)  => d.handle_key(key, mods),
             Overlay::NewGroup(d) => d.handle_key(key, mods),
+            Overlay::Help(d)     => d.handle_key(key, mods),
         }
     }
 
@@ -86,6 +90,7 @@ impl Overlay {
             Overlay::Passwd(d)   => d.render(buf, area),
             Overlay::NewUser(d)  => d.render(buf, area),
             Overlay::NewGroup(d) => d.render(buf, area),
+            Overlay::Help(d)     => d.render(buf, area),
         }
     }
 }

@@ -18,7 +18,7 @@ pub fn render_select(app: &App, buf: &mut Buffer) {
     mullion::border::draw_box(buf, area, Borders::ALL, &box_style());
     btxt(buf, area.x + 2, area.y, "  census — select group  ", s_title());
     btxt(buf, area.x + 2, area.y + area.height - 1,
-         " jk:scroll  Enter:manage  n:new  D:del  Esc:cancel ", s_dim());
+         " jk:scroll  Enter:manage  n:new  D:del  ?:help  Esc:cancel ", s_dim());
 
     let inner = inset(area, 1);
     if inner.height < 3 { return; }
