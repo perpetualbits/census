@@ -38,6 +38,20 @@ pub struct Group {
     pub members: Vec<String>,
 }
 
+/// Fields for creating a new user entry.
+#[derive(Debug, Clone)]
+pub struct NewUserSpec {
+    pub uid: String,
+    pub cn: String,
+    pub sn: String,
+    pub given_name: Option<String>,
+    pub uid_number: u32,
+    pub gid_number: u32,
+    pub home: String,
+    pub shell: String,
+    pub password: Option<String>,
+}
+
 impl LdapClient {
     pub fn connect(cfg: &Config, password: Option<&str>) -> anyhow::Result<Self> {
         let (host, port, tun) = resolve_endpoint(cfg)?;
@@ -275,6 +289,76 @@ impl LdapClient {
                 self.modify_replace(dn, "userPassword", &[&hashed])
             }
         }
+    }
+
+    // ---------- create / delete ---------------------------------------------
+
+    /// Lowest free uidNumber above the current maximum (floored at 10000).
+    pub fn next_uid_number(&mut self) -> anyhow::Result<u32> {
+        let base   = self.schema.user_base(&self.base_dn);
+        let filter = self.schema.user_filter;     // &'static str
+        let attr   = self.schema.uid_number;
+        let (rs, _) = self.conn
+            .search(&base, Scope::OneLevel, filter, vec![attr])
+            .context("uidNumber scan failed")?
+            .success()
+            .context("uidNumber scan rejected")?;
+        let max = rs.into_iter()
+            .filter_map(|e| {
+                SearchEntry::construct(e).attrs.get(attr)
+                    .and_then(|v| v.first())
+                    .and_then(|s| s.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(9999);
+        Ok(max.max(9999) + 1)
+    }
+
+    /// Create a new user entry, then set its password if one was supplied.
+    /// Returns the new entry's DN.
+    pub fn add_user(&mut self, spec: &NewUserSpec) -> anyhow::Result<String> {
+        let s = self.schema.clone();
+        let dn = s.user_dn(&spec.uid, &self.base_dn);
+
+        let one = |v: String| -> HashSet<String> { HashSet::from([v]) };
+        let mut attrs: Vec<(String, HashSet<String>)> = vec![
+            ("objectClass".into(), s.user_object_classes.iter().map(|c| c.to_string()).collect()),
+            (s.uid.into(),        one(spec.uid.clone())),
+            (s.cn.into(),         one(spec.cn.clone())),
+            (s.sn.into(),         one(spec.sn.clone())),
+            (s.uid_number.into(), one(spec.uid_number.to_string())),
+            (s.gid_number.into(), one(spec.gid_number.to_string())),
+            (s.home.into(),       one(spec.home.clone())),
+            (s.shell.into(),      one(spec.shell.clone())),
+        ];
+        if let Some(g) = &spec.given_name {
+            if !g.is_empty() {
+                attrs.push((s.given_name.into(), one(g.clone())));
+            }
+        }
+
+        self.conn
+            .add(&dn, attrs)
+            .context("Add user failed")?
+            .success()
+            .context("Add user rejected")?;
+
+        if let Some(pw) = &spec.password {
+            if !pw.is_empty() {
+                self.set_password(&dn, pw)?;
+            }
+        }
+        Ok(dn)
+    }
+
+    /// Delete an entry by DN.
+    pub fn delete_entry(&mut self, dn: &str) -> anyhow::Result<()> {
+        self.conn
+            .delete(dn)
+            .context("Delete failed")?
+            .success()
+            .context("Delete rejected")?;
+        Ok(())
     }
 
     pub fn close(mut self) -> anyhow::Result<()> {

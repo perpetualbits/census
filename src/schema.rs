@@ -7,11 +7,7 @@
 //! touching the LDAP or TUI layers.
 
 /// Attribute names, object classes, and container layout for a directory.
-///
-/// Fields are consumed progressively as the write features land (user creation
-/// reads `user_object_classes`, the SSH-key view reads `ssh_object_class`, …).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // descriptor: some fields are wired up in later phases
 pub struct Schema {
     /// RDN attribute of a user entry, e.g. `uid`.
     pub user_rdn: &'static str,
@@ -77,7 +73,6 @@ impl Schema {
     }
 
     /// DN of a single user with the given RDN value under `base_dn`.
-    #[allow(dead_code)] // wired up by user create/delete (P8)
     pub fn user_dn(&self, rdn_value: &str, base_dn: &str) -> String {
         format!("{}={},{},{}", self.user_rdn, rdn_value, self.user_ou, base_dn)
     }

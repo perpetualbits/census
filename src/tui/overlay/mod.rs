@@ -8,6 +8,7 @@
 pub mod confirm;
 pub mod input;
 pub mod keys;
+pub mod newuser;
 pub mod passwd;
 
 use mullion::{Buffer, KeyCode, KeyModifiers, Rect};
@@ -15,7 +16,10 @@ use mullion::{Buffer, KeyCode, KeyModifiers, Rect};
 pub use confirm::ConfirmDialog;
 pub use input::InputDialog;
 pub use keys::KeyEditor;
+pub use newuser::NewUserForm;
 pub use passwd::PasswdDialog;
+
+use crate::ldap::client::NewUserSpec;
 
 /// A write the user has requested. The app gates and executes these centrally.
 #[derive(Clone)]
@@ -30,6 +34,10 @@ pub enum Action {
     DelMember { group_dn: String, uid: String, group: String },
     /// Set a user's password (plaintext; the client hashes per config).
     SetPasswd { dn: String, plaintext: String },
+    /// Create a new user entry.
+    CreateUser(NewUserSpec),
+    /// Delete an entry by DN (`label` is shown in status messages).
+    DeleteEntry { dn: String, label: String },
 }
 
 /// What a modal asks the app to do after a keystroke.
@@ -48,6 +56,7 @@ pub enum Overlay {
     Keys(KeyEditor),
     Confirm(ConfirmDialog),
     Passwd(PasswdDialog),
+    NewUser(NewUserForm),
 }
 
 impl Overlay {
@@ -57,6 +66,7 @@ impl Overlay {
             Overlay::Keys(d)    => d.handle_key(key, mods),
             Overlay::Confirm(d) => d.handle_key(key, mods),
             Overlay::Passwd(d)  => d.handle_key(key, mods),
+            Overlay::NewUser(d) => d.handle_key(key, mods),
         }
     }
 
@@ -66,6 +76,7 @@ impl Overlay {
             Overlay::Keys(d)    => d.render(buf, area),
             Overlay::Confirm(d) => d.render(buf, area),
             Overlay::Passwd(d)  => d.render(buf, area),
+            Overlay::NewUser(d) => d.render(buf, area),
         }
     }
 }

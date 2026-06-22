@@ -31,7 +31,7 @@ pub fn render(app: &App, buf: &mut Buffer, focus: Pane) {
             let hint = if focus == Pane::Right {
                 " Tab:pane  jk:attr  e:edit  K:keys  p:passwd  g:groups  q:quit "
             } else {
-                " Tab:pane  g:groups  ↑↓/jk:users  q:quit "
+                " Tab:pane  jk:users  n:new  D:del  g:groups  q:quit "
             };
             btxt(buf, area.x + 2, bottom, hint, s_dim());
             let count = format!(" {} users ", app.users().len());

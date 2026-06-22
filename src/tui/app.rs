@@ -221,6 +221,8 @@ fn handle_key(
         Mode::Browse => match (app.browse_focus, key) {
             (_, Char('q')) | (_, Esc) => return Ok(true),
             (_, Char('g')) => { app.mode = Mode::GroupSelect; app.groups_cur.reset(); }
+            (_, Char('n')) => open_new_user(app),
+            (_, Char('D')) => open_delete_user(app),
             (_, Tab) | (_, BackTab) => {
                 app.browse_focus =
                     if app.browse_focus == Pane::Left { Pane::Right } else { Pane::Left };
@@ -345,6 +347,30 @@ fn open_passwd(app: &mut App) {
     app.overlay = Some(Overlay::Passwd(dlg));
 }
 
+/// Open the new-user form, seeded with the next free uidNumber.
+fn open_new_user(app: &mut App) {
+    if !app.write_mode {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let suggested = app.session_mut().client.next_uid_number().unwrap_or(10000);
+    app.overlay = Some(Overlay::NewUser(overlay::NewUserForm::new(suggested)));
+}
+
+/// Open a typed-DN delete confirmation for the user under the list cursor.
+fn open_delete_user(app: &mut App) {
+    if !app.write_mode {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let Some(user) = app.users().get(app.users_cur.cursor) else { return; };
+    let dn  = user.dn.clone();
+    let uid = user.uid.clone();
+    let prompt = format!("Delete user {uid}? Irreversible.");
+    let action = Action::DeleteEntry { dn: dn.clone(), label: uid };
+    app.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::typed_dn(prompt, dn, action)));
+}
+
 // ─── write chokepoint ─────────────────────────────────────────────────────────
 
 /// Execute a committed [`Action`]. The single place writes happen: gated on
@@ -407,6 +433,27 @@ fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
                 Err(e)  => { app.status = Some((format!("Error: {e}"), true)); }
             }
         }
+        Action::CreateUser(spec) => {
+            let uid = spec.uid.clone();
+            match app.session_mut().client.add_user(&spec) {
+                Ok(_dn) => {
+                    app.session_mut().refresh_users()?;
+                    app.select_user(&uid);
+                    app.status = Some((format!("Created user {uid}"), false));
+                }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            }
+        }
+        Action::DeleteEntry { dn, label } => {
+            match app.session_mut().client.delete_entry(&dn) {
+                Ok(()) => {
+                    app.session_mut().refresh_users()?;
+                    app.clamp_and_reload_detail();
+                    app.status = Some((format!("Deleted {label}"), false));
+                }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            }
+        }
     }
     Ok(())
 }
@@ -421,6 +468,23 @@ impl App {
             }
         }
         let _ = self.session_mut().refresh_users();
+    }
+
+    /// Move the list cursor to `uid` (if present) and load its detail.
+    fn select_user(&mut self, uid: &str) {
+        if let Some(i) = self.users().iter().position(|u| u.uid == uid) {
+            self.users_cur.cursor = i;
+        }
+        self.detail = None;
+        self.ensure_detail_loaded();
+    }
+
+    /// Clamp the list cursor to the (possibly shrunk) list and reload detail.
+    fn clamp_and_reload_detail(&mut self) {
+        let len = self.users().len();
+        self.users_cur.clamp(len);
+        self.detail = None;
+        self.ensure_detail_loaded();
     }
 }
 
