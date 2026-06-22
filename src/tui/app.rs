@@ -1,6 +1,6 @@
 //! TUI orchestrator: application state, event loop, key routing, render dispatch.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::Event;
 use mullion::{backend::CrosstermBackend, poll_event, Buffer, KeyCode, KeyModifiers, Rect, Terminal};
@@ -9,8 +9,12 @@ use crate::ldap::client::{Group, User};
 use crate::session::Session;
 
 use super::focus::{ListCursor, Pane};
+use super::glow;
 use super::overlay::{self, Action, Overlay, OverlayResult};
 use super::screens;
+
+/// Idle redraw cap — keeps the border glow animating at ~20 fps.
+const RENDER_TICK: Duration = Duration::from_millis(50);
 
 // ─── state ───────────────────────────────────────────────────────────────────
 
@@ -39,6 +43,9 @@ pub struct App {
     overlay: Option<Overlay>,
     pub status:     Option<(String, bool)>,
     pub write_mode: bool,
+
+    anim_start: Instant,
+    anim_on: bool,
 }
 
 impl App {
@@ -57,6 +64,8 @@ impl App {
             right_cur: ListCursor::new(),
             overlay: None,
             status: None, write_mode,
+            anim_start: Instant::now(),
+            anim_on: true,
         }
     }
 
@@ -144,7 +153,9 @@ fn main_loop(
             render(app, buf);
         })?;
 
-        match poll_event(Duration::from_millis(100))? {
+        // Cap the wait so the border glow keeps animating while idle.
+        let wait = if app.anim_on { RENDER_TICK } else { Duration::from_millis(100) };
+        match poll_event(wait)? {
             None => continue,
             Some(Event::Key(key)) => {
                 if handle_key(app, key.code, key.modifiers)? {
@@ -201,6 +212,12 @@ fn handle_key(
     use KeyCode::*;
 
     if key == Char('c') && mods.contains(KeyModifiers::CONTROL) { return Ok(true); }
+
+    // Ctrl-G toggles the border glow (motion off switch).
+    if key == Char('g') && mods.contains(KeyModifiers::CONTROL) {
+        app.anim_on = !app.anim_on;
+        return Ok(false);
+    }
 
     // A modal overlay, when present, consumes every key.
     if let Some(ov) = &mut app.overlay {
@@ -551,6 +568,10 @@ fn render(app: &App, buf: &mut Buffer) {
         Mode::Browse      => screens::users::render(app, buf, app.browse_focus),
         Mode::GroupSelect => screens::groups::render_select(app, buf),
         Mode::Membership  => screens::groups::render_membership(app, buf),
+    }
+    // Travelling glow on the outer frame, under any modal overlay.
+    if app.anim_on {
+        glow::edge_glow(buf, buf.area, app.anim_start.elapsed().as_secs_f32());
     }
     if let Some(ov) = &app.overlay {
         ov.render(buf, buf.area);
