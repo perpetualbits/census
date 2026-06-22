@@ -12,6 +12,7 @@ pub struct LdapClient {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // full LDAP record; not every field is surfaced in the TUI yet
 pub struct User {
     pub dn: String,
     pub uid: String,
@@ -25,6 +26,7 @@ pub struct User {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // gid_number kept for completeness; not shown in the TUI yet
 pub struct Group {
     pub dn: String,
     pub name: String,
@@ -116,6 +118,7 @@ impl LdapClient {
         Ok(users)
     }
 
+    #[allow(dead_code)] // detail-view lookup; wired up when per-user view lands
     pub fn get_user(&mut self, uid: &str) -> anyhow::Result<Option<User>> {
         let base = format!("ou=users,{}", self.base_dn);
         let filter = format!("(uid={uid})");
@@ -189,6 +192,7 @@ impl LdapClient {
         Ok(())
     }
 
+    #[allow(dead_code)] // attribute editing; wired up when the edit view lands
     pub fn set_attr(&mut self, dn: &str, attr: &str, value: &str) -> anyhow::Result<()> {
         self.conn
             .modify(dn, vec![Mod::Replace(attr, HashSet::from([value]))])

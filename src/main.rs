@@ -1,5 +1,6 @@
 mod config;
 mod ldap;
+mod tui;
 
 use std::path::PathBuf;
 
@@ -37,9 +38,10 @@ fn main() -> anyhow::Result<()> {
         return cmd_ping(&cfg, password.as_deref(), allow_writes);
     }
 
-    // TUI launch goes here once the UI layer is built.
-    eprintln!("TUI not yet implemented — run with --ping to test connectivity.");
-    Ok(())
+    let mut client = LdapClient::connect(&cfg, password.as_deref())?;
+    let result = tui::run(&mut client, &cfg, allow_writes);
+    client.close().ok();
+    result
 }
 
 fn cmd_ping(cfg: &Config, password: Option<&str>, allow_writes: bool) -> anyhow::Result<()> {

@@ -11,9 +11,11 @@ name = "census"
 path = "src/main.rs"
 
 [dependencies]
-anyhow    = "1"
-clap      = { version = "4", features = ["derive"] }
+anyhow     = "1"
+clap       = { version = "4", features = ["derive"] }
+crossterm  = "0.28"
 ldap3     = { version = "0.11", default-features = false, features = ["sync", "tls-rustls"] }
+mullion   = { path = "../mullion", version = "0.3.0" }
 rpassword = "7"
 serde     = { version = "1", features = ["derive"] }
 toml      = "0.8"

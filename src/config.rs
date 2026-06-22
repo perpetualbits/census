@@ -24,6 +24,9 @@ pub struct ServerConfig {
     /// Shell command whose stdout is the bind password (e.g. `rbw get "My LDAP"`).
     /// Preferred over CENSUS_BIND_PASSWORD env var; both beat interactive prompt.
     pub password_cmd: Option<String>,
+    /// TLS SNI / certificate name override. Reserved for verified tunnel
+    /// connections; not consulted by the rustls path yet.
+    #[allow(dead_code)]
     pub sni: Option<String>,
     #[serde(default = "default_true")]
     pub verify: bool,

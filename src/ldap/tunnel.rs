@@ -2,6 +2,7 @@ use std::net::{TcpStream, SocketAddr};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[allow(dead_code)] // endpoint fields kept for diagnostics; only local_port is read today
 pub struct Tunnel {
     pub local_host: String,
     pub local_port: u16,
@@ -12,6 +13,7 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
+    #[allow(dead_code)] // useful for a future "(reused tunnel)" status line
     pub fn is_reused(&self) -> bool { self.child.is_none() }
 }
 
