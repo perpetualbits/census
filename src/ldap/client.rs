@@ -118,7 +118,6 @@ impl LdapClient {
     }
 
     /// Fetch a single user with all attributes (`*` + operational `+`).
-    #[allow(dead_code)] // wired up by the detail view (P2)
     pub fn get_user(&mut self, uid: &str) -> anyhow::Result<Option<User>> {
         let s = &self.schema;
         let base = s.user_base(&self.base_dn);

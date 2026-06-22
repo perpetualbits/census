@@ -24,6 +24,11 @@ pub struct App {
     pub users_cur:  ListCursor,
     pub groups_cur: ListCursor,
 
+    // Browse screen.
+    pub browse_focus: Pane,
+    pub detail_scroll: usize,
+    detail: Option<User>,        // full record of the cursored user (lazy-loaded)
+
     selected_group: usize,
     pub active_pane: Pane,
     pub left_cur:  ListCursor,
@@ -39,6 +44,9 @@ impl App {
             sessions, active: 0, mode: Mode::Browse,
             users_cur: ListCursor::new(),
             groups_cur: ListCursor::new(),
+            browse_focus: Pane::Left,
+            detail_scroll: 0,
+            detail: None,
             selected_group: 0,
             active_pane: Pane::Left,
             left_cur: ListCursor::new(),
@@ -56,7 +64,16 @@ impl App {
 
     pub fn users(&self) -> &[User] { &self.session().users }
     pub fn groups(&self) -> &[Group] { &self.session().groups }
-    pub fn user_groups(&self) -> &[Vec<String>] { &self.session().user_groups }
+
+    pub fn detail(&self) -> Option<&User> { self.detail.as_ref() }
+
+    /// Names of the groups `uid` belongs to (active session).
+    pub fn groups_of(&self, uid: &str) -> Vec<String> {
+        self.groups().iter()
+            .filter(|g| g.members.iter().any(|m| m == uid))
+            .map(|g| g.name.clone())
+            .collect()
+    }
 
     pub fn selected_group(&self) -> Option<&Group> {
         self.groups().get(self.selected_group)
@@ -73,12 +90,30 @@ impl App {
             .filter_map(|uid| users.iter().find(|u| &u.uid == uid))
             .collect()
     }
+
+    /// The uid under the browse cursor, if any.
+    fn cursor_uid(&self) -> Option<String> {
+        self.users().get(self.users_cur.cursor).map(|u| u.uid.clone())
+    }
+
+    /// Fetch the full record for the cursored user if it isn't already loaded.
+    fn ensure_detail_loaded(&mut self) {
+        let Some(uid) = self.cursor_uid() else { self.detail = None; return; };
+        if self.detail.as_ref().map(|u| u.uid.as_str()) == Some(uid.as_str()) {
+            return;
+        }
+        match self.session_mut().client.get_user(&uid) {
+            Ok(full) => { self.detail = full; self.detail_scroll = 0; }
+            Err(e)   => { self.status = Some((format!("detail load failed: {e}"), true)); }
+        }
+    }
 }
 
 // ─── entry point ─────────────────────────────────────────────────────────────
 
 pub fn run(sessions: Vec<Session>, write_mode: bool) -> anyhow::Result<()> {
     let mut app = App::new(sessions, write_mode);
+    app.ensure_detail_loaded();
 
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     term.enter()?;
@@ -129,6 +164,12 @@ fn update_offsets(app: &mut App, area: Rect) {
     let rlen = app.member_uids().len();
     app.right_cur.clamp(rlen);
     app.right_cur.keep_in_view(vis);
+
+    // Clamp detail-pane scroll so it can't run off the end of the content.
+    // Body height = inner(area-2) - header(1) - sep(1) = vis - 2.
+    let detail_vis = vis.saturating_sub(2);
+    let max_scroll = screens::detail::row_count(app).saturating_sub(detail_vis.max(1));
+    if app.detail_scroll > max_scroll { app.detail_scroll = max_scroll; }
 }
 
 // ─── key handling ────────────────────────────────────────────────────────────
@@ -145,13 +186,23 @@ fn handle_key(
     app.status = None;
 
     match app.mode {
-        Mode::Browse => match key {
-            Char('q') | Esc => return Ok(true),
-            Char('g') => { app.mode = Mode::GroupSelect; app.groups_cur.reset(); }
-            Up   | Char('k') => app.users_cur.up(),
-            Down | Char('j') => app.users_cur.down(app.users().len()),
-            PageUp   => app.users_cur.page(-10, app.users().len()),
-            PageDown => app.users_cur.page(10, app.users().len()),
+        Mode::Browse => match (app.browse_focus, key) {
+            (_, Char('q')) | (_, Esc) => return Ok(true),
+            (_, Char('g')) => { app.mode = Mode::GroupSelect; app.groups_cur.reset(); }
+            (_, Tab) | (_, BackTab) => {
+                app.browse_focus =
+                    if app.browse_focus == Pane::Left { Pane::Right } else { Pane::Left };
+            }
+            // Left pane: navigate the user list (reloads the detail record).
+            (Pane::Left, Up   | Char('k')) => { app.users_cur.up();              app.ensure_detail_loaded(); }
+            (Pane::Left, Down | Char('j')) => { app.users_cur.down(app.users().len()); app.ensure_detail_loaded(); }
+            (Pane::Left, PageUp)   => { app.users_cur.page(-10, app.users().len()); app.ensure_detail_loaded(); }
+            (Pane::Left, PageDown) => { app.users_cur.page(10, app.users().len());  app.ensure_detail_loaded(); }
+            // Right pane: scroll the detail body.
+            (Pane::Right, Up   | Char('k')) => { app.detail_scroll = app.detail_scroll.saturating_sub(1); }
+            (Pane::Right, Down | Char('j')) => { app.detail_scroll += 1; }
+            (Pane::Right, PageUp)   => { app.detail_scroll = app.detail_scroll.saturating_sub(10); }
+            (Pane::Right, PageDown) => { app.detail_scroll += 10; }
             _ => {}
         },
 
@@ -240,7 +291,7 @@ fn do_membership_action(app: &mut App) -> anyhow::Result<()> {
 
 fn render(app: &App, buf: &mut Buffer) {
     match app.mode {
-        Mode::Browse      => screens::users::render(app, buf),
+        Mode::Browse      => screens::users::render(app, buf, app.browse_focus),
         Mode::GroupSelect => screens::groups::render_select(app, buf),
         Mode::Membership  => screens::groups::render_membership(app, buf),
     }
