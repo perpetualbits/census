@@ -9,6 +9,7 @@ use crate::ldap::client::{Group, User};
 use crate::session::Session;
 
 use super::focus::{ListCursor, Pane};
+use super::overlay::{self, Action, Overlay, OverlayResult};
 use super::screens;
 
 // ─── state ───────────────────────────────────────────────────────────────────
@@ -27,6 +28,7 @@ pub struct App {
     // Browse screen.
     pub browse_focus: Pane,
     pub detail_scroll: usize,
+    pub detail_cur: usize,       // index into the detail pane's editable targets
     detail: Option<User>,        // full record of the cursored user (lazy-loaded)
 
     selected_group: usize,
@@ -34,6 +36,7 @@ pub struct App {
     pub left_cur:  ListCursor,
     pub right_cur: ListCursor,
 
+    overlay: Option<Overlay>,
     pub status:     Option<(String, bool)>,
     pub write_mode: bool,
 }
@@ -46,11 +49,13 @@ impl App {
             groups_cur: ListCursor::new(),
             browse_focus: Pane::Left,
             detail_scroll: 0,
+            detail_cur: 0,
             detail: None,
             selected_group: 0,
             active_pane: Pane::Left,
             left_cur: ListCursor::new(),
             right_cur: ListCursor::new(),
+            overlay: None,
             status: None, write_mode,
         }
     }
@@ -103,7 +108,7 @@ impl App {
             return;
         }
         match self.session_mut().client.get_user(&uid) {
-            Ok(full) => { self.detail = full; self.detail_scroll = 0; }
+            Ok(full) => { self.detail = full; self.detail_scroll = 0; self.detail_cur = 0; }
             Err(e)   => { self.status = Some((format!("detail load failed: {e}"), true)); }
         }
     }
@@ -165,10 +170,24 @@ fn update_offsets(app: &mut App, area: Rect) {
     app.right_cur.clamp(rlen);
     app.right_cur.keep_in_view(vis);
 
+    // Detail body height = inner(area-2) - header(1) - sep(1) = vis - 2.
+    let detail_vis = vis.saturating_sub(2).max(1);
+
+    // Keep the selected editable attribute (right pane) within the body.
+    if app.mode == Mode::Browse && app.browse_focus == Pane::Right {
+        let ntargets = screens::detail::edit_targets(app).len();
+        if ntargets > 0 && app.detail_cur >= ntargets { app.detail_cur = ntargets - 1; }
+        if let Some(row) = screens::detail::target_row(app, app.detail_cur) {
+            if row < app.detail_scroll {
+                app.detail_scroll = row;
+            } else if row >= app.detail_scroll + detail_vis {
+                app.detail_scroll = row + 1 - detail_vis;
+            }
+        }
+    }
+
     // Clamp detail-pane scroll so it can't run off the end of the content.
-    // Body height = inner(area-2) - header(1) - sep(1) = vis - 2.
-    let detail_vis = vis.saturating_sub(2);
-    let max_scroll = screens::detail::row_count(app).saturating_sub(detail_vis.max(1));
+    let max_scroll = screens::detail::row_count(app).saturating_sub(detail_vis);
     if app.detail_scroll > max_scroll { app.detail_scroll = max_scroll; }
 }
 
@@ -182,6 +201,19 @@ fn handle_key(
     use KeyCode::*;
 
     if key == Char('c') && mods.contains(KeyModifiers::CONTROL) { return Ok(true); }
+
+    // A modal overlay, when present, consumes every key.
+    if let Some(ov) = &mut app.overlay {
+        match ov.handle_key(key, mods) {
+            OverlayResult::Stay   => {}
+            OverlayResult::Cancel => app.overlay = None,
+            OverlayResult::Commit(action) => {
+                app.overlay = None;
+                perform(app, action)?;
+            }
+        }
+        return Ok(false);
+    }
 
     app.status = None;
 
@@ -198,11 +230,13 @@ fn handle_key(
             (Pane::Left, Down | Char('j')) => { app.users_cur.down(app.users().len()); app.ensure_detail_loaded(); }
             (Pane::Left, PageUp)   => { app.users_cur.page(-10, app.users().len()); app.ensure_detail_loaded(); }
             (Pane::Left, PageDown) => { app.users_cur.page(10, app.users().len());  app.ensure_detail_loaded(); }
-            // Right pane: scroll the detail body.
-            (Pane::Right, Up   | Char('k')) => { app.detail_scroll = app.detail_scroll.saturating_sub(1); }
-            (Pane::Right, Down | Char('j')) => { app.detail_scroll += 1; }
-            (Pane::Right, PageUp)   => { app.detail_scroll = app.detail_scroll.saturating_sub(10); }
-            (Pane::Right, PageDown) => { app.detail_scroll += 10; }
+            // Right pane: move the editable-attribute cursor.
+            (Pane::Right, Up   | Char('k')) => { app.detail_cur = app.detail_cur.saturating_sub(1); }
+            (Pane::Right, Down | Char('j')) => {
+                let n = screens::detail::edit_targets(app).len();
+                if app.detail_cur + 1 < n { app.detail_cur += 1; }
+            }
+            (Pane::Right, Char('e')) => open_attr_edit(app),
             _ => {}
         },
 
@@ -287,6 +321,62 @@ fn do_membership_action(app: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Open the attribute-edit modal for the detail pane's selected target.
+fn open_attr_edit(app: &mut App) {
+    if !app.write_mode {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let targets = screens::detail::edit_targets(app);
+    let Some(target) = targets.get(app.detail_cur) else { return; };
+    let dn = match app.detail() { Some(u) => u.dn.clone(), None => return };
+    let dlg = overlay::InputDialog::edit_attr(dn, target.attr.clone(), &target.value);
+    app.overlay = Some(Overlay::Input(dlg));
+}
+
+// ─── write chokepoint ─────────────────────────────────────────────────────────
+
+/// Execute a committed [`Action`]. The single place writes happen: gated on
+/// `--write`, then dispatched to the active session's client, then the affected
+/// caches are refreshed.
+fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
+    if !app.write_mode {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return Ok(());
+    }
+    match action {
+        Action::SetAttr { dn, attr, values } => {
+            let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+            match app.session_mut().client.modify_replace(&dn, &attr, &refs) {
+                Ok(()) => {
+                    app.reload_detail_record();
+                    let msg = if refs.is_empty() {
+                        format!("Cleared {attr}")
+                    } else {
+                        format!("Set {attr}")
+                    };
+                    app.status = Some((msg, false));
+                }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            }
+        }
+    }
+    Ok(())
+}
+
+impl App {
+    /// Re-fetch the cursored user's full record and refresh the list cache so an
+    /// edit is reflected in both the detail pane and the left list.
+    fn reload_detail_record(&mut self) {
+        if let Some(uid) = self.cursor_uid() {
+            if let Ok(full) = self.session_mut().client.get_user(&uid) {
+                self.detail = full;
+            }
+        }
+        let _ = self.session_mut().refresh_users();
+    }
+}
+
 // ─── render dispatch ─────────────────────────────────────────────────────────
 
 fn render(app: &App, buf: &mut Buffer) {
@@ -294,5 +384,8 @@ fn render(app: &App, buf: &mut Buffer) {
         Mode::Browse      => screens::users::render(app, buf, app.browse_focus),
         Mode::GroupSelect => screens::groups::render_select(app, buf),
         Mode::Membership  => screens::groups::render_membership(app, buf),
+    }
+    if let Some(ov) = &app.overlay {
+        ov.render(buf, buf.area);
     }
 }

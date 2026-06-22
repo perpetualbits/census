@@ -28,8 +28,12 @@ pub fn render(app: &App, buf: &mut Buffer, focus: Pane) {
                  if *is_err { s_err() } else { s_ok() });
         }
         None => {
-            btxt(buf, area.x + 2, bottom,
-                 " Tab:pane  g:groups  ↑↓/jk:scroll  q:quit ", s_dim());
+            let hint = if focus == Pane::Right {
+                " Tab:pane  ↑↓/jk:attr  e:edit  g:groups  q:quit "
+            } else {
+                " Tab:pane  g:groups  ↑↓/jk:users  q:quit "
+            };
+            btxt(buf, area.x + 2, bottom, hint, s_dim());
             let count = format!(" {} users ", app.users().len());
             let cx = area.x + area.width.saturating_sub(1 + count.len() as u16);
             btxt(buf, cx, bottom, &count, s_dim());

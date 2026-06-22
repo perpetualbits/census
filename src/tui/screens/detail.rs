@@ -1,4 +1,7 @@
 //! Per-user detail pane: full attribute record, group memberships, SSH keys.
+//!
+//! When the pane is focused, a cursor selects one *editable* attribute (see
+//! [`EDITABLE`]); the app reads [`selected_target`] to drive attribute editing.
 
 use mullion::{
     label::Align,
@@ -8,7 +11,7 @@ use mullion::{
 
 use crate::ldap::client::User;
 use crate::tui::app::App;
-use crate::tui::draw::{btxt, hline};
+use crate::tui::draw::{btxt, fill_row, hline};
 use crate::tui::theme::*;
 
 /// One rendered line in the (scrollable) detail body.
@@ -20,14 +23,26 @@ enum Row {
     Blank,
 }
 
-/// Attributes shown first, in this order, when present. Everything else follows
-/// alphabetically. `sshPublicKey` and `objectClass` are rendered in their own
-/// sections, so they are excluded from the generic attribute list.
+/// An editable attribute the detail cursor can land on.
+#[derive(Clone)]
+pub struct EditTarget {
+    row: usize,
+    pub attr: String,
+    pub value: String,
+}
+
+/// Attributes shown first, in this order, when present.
 const PRIMARY: &[&str] = &[
     "uid", "cn", "sn", "givenName", "uidNumber", "gidNumber",
     "homeDirectory", "loginShell", "mail", "telephoneNumber",
 ];
+/// Rendered in their own sections rather than the generic attribute list.
 const HIDDEN: &[&str] = &["sshPublicKey", "objectClass", "userPassword"];
+/// Attributes the cursor may select and edit (single-valued, admin-safe).
+const EDITABLE: &[&str] = &[
+    "cn", "sn", "givenName", "displayName", "mail", "telephoneNumber",
+    "loginShell", "homeDirectory", "gidNumber",
+];
 
 pub fn render(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
     if area.width < 12 || area.height < 3 { return; }
@@ -38,9 +53,11 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
         return;
     };
 
-    let rows = build_rows(app, user);
+    let (rows, targets) = model(user, &app.groups_of(&user.uid));
+    let sel_row = (focused && !targets.is_empty())
+        .then(|| targets.get(app.detail_cur).map(|t| t.row))
+        .flatten();
 
-    // Header line is fixed; body below it scrolls.
     ColumnGrid::write_text(buf, area, area.y, "detail", Align::Start, head);
     hline(buf, Rect::new(area.x, area.y + 1, area.width, 1));
 
@@ -52,20 +69,22 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
     let cols = grid.resolve(body);
 
     for (i, row) in rows.iter().enumerate().skip(off).take(vis) {
-        let y = body.y + (i - off) as u16;
+        let y   = body.y + (i - off) as u16;
+        let sel = Some(i) == sel_row;
+        if sel { fill_row(buf, body.x, y, body.width, s_sel()); }
         match row {
-            Row::Title(t)   => btxt(buf, body.x, y, t, s_title()),
+            Row::Title(t)   => btxt(buf, body.x, y, t, if sel { s_sel() } else { s_title() }),
             Row::Section(t) => btxt(buf, body.x, y, t, head),
             Row::Kv(k, v) => {
-                ColumnGrid::write_text(buf, cols[0], y, k, Align::Start, s_dim());
-                ColumnGrid::write_text(buf, cols[2], y, v, Align::Start, s_normal());
+                let (ks, vs) = if sel { (s_sel(), s_sel()) } else { (s_dim(), s_normal()) };
+                ColumnGrid::write_text(buf, cols[0], y, k, Align::Start, ks);
+                ColumnGrid::write_text(buf, cols[2], y, v, Align::Start, vs);
             }
-            Row::Text(t) => btxt(buf, body.x + 2, y, t, s_normal()),
+            Row::Text(t) => btxt(buf, body.x + 2, y, t, if sel { s_sel() } else { s_normal() }),
             Row::Blank => {}
         }
     }
 
-    // Scroll affordance.
     if rows.len() > vis {
         let more = format!("… {}/{} ", off + vis.min(rows.len() - off), rows.len());
         let mx = area.x + area.width.saturating_sub(more.len() as u16);
@@ -73,16 +92,32 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
     }
 }
 
-/// Total scrollable rows for the currently-selected user (for scroll clamping).
-pub fn row_count(app: &App) -> usize {
+/// Build the row model + edit targets for the currently-selected user.
+fn build(app: &App) -> (Vec<Row>, Vec<EditTarget>) {
     match app.detail() {
-        Some(user) => build_rows(app, user).len(),
-        None => 0,
+        Some(user) => model(user, &app.groups_of(&user.uid)),
+        None => (Vec::new(), Vec::new()),
     }
 }
 
-fn build_rows(app: &App, user: &User) -> Vec<Row> {
+/// Editable targets for the currently-selected user (cursor order = render order).
+pub fn edit_targets(app: &App) -> Vec<EditTarget> {
+    build(app).1
+}
+
+/// The row index of the `n`-th edit target (for keeping the cursor in view).
+pub fn target_row(app: &App, idx: usize) -> Option<usize> {
+    edit_targets(app).get(idx).map(|t| t.row)
+}
+
+/// Total scrollable rows for the currently-selected user (for scroll clamping).
+pub fn row_count(app: &App) -> usize {
+    build(app).0.len()
+}
+
+fn model(user: &User, group_names: &[String]) -> (Vec<Row>, Vec<EditTarget>) {
     let mut rows = Vec::new();
+    let mut targets = Vec::new();
 
     let title = if user.cn.is_empty() {
         user.uid.clone()
@@ -92,11 +127,18 @@ fn build_rows(app: &App, user: &User) -> Vec<Row> {
     rows.push(Row::Title(title));
     rows.push(Row::Blank);
 
+    let push_kv = |rows: &mut Vec<Row>, targets: &mut Vec<EditTarget>, name: &str, val: &str| {
+        if EDITABLE.contains(&name) {
+            targets.push(EditTarget { row: rows.len(), attr: name.to_string(), value: val.to_string() });
+        }
+        rows.push(Row::Kv(name.to_string(), val.to_string()));
+    };
+
     // Primary attributes first, in declared order.
     for &name in PRIMARY {
         if let Some(vals) = user.attrs.get(name) {
             for v in vals {
-                rows.push(Row::Kv(name.to_string(), v.clone()));
+                push_kv(&mut rows, &mut targets, name, v);
             }
         }
     }
@@ -109,19 +151,18 @@ fn build_rows(app: &App, user: &User) -> Vec<Row> {
     for k in others {
         if let Some(vals) = user.attrs.get(k) {
             for v in vals {
-                rows.push(Row::Kv(k.clone(), v.clone()));
+                push_kv(&mut rows, &mut targets, k, v);
             }
         }
     }
 
-    // Group memberships (computed against the active session's groups).
-    let groups = app.groups_of(&user.uid);
+    // Group memberships.
     rows.push(Row::Blank);
-    rows.push(Row::Section(format!("groups ({})", groups.len())));
-    if groups.is_empty() {
+    rows.push(Row::Section(format!("groups ({})", group_names.len())));
+    if group_names.is_empty() {
         rows.push(Row::Text("(none)".into()));
     } else {
-        rows.push(Row::Text(groups.join(", ")));
+        rows.push(Row::Text(group_names.join(", ")));
     }
 
     // SSH keys.
@@ -135,7 +176,7 @@ fn build_rows(app: &App, user: &User) -> Vec<Row> {
         }
     }
 
-    rows
+    (rows, targets)
 }
 
 /// Condense an OpenSSH public key line to `type …tail comment`.

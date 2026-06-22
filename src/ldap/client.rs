@@ -184,13 +184,40 @@ impl LdapClient {
         Ok(())
     }
 
-    #[allow(dead_code)] // attribute editing; wired up when the edit view lands
-    pub fn set_attr(&mut self, dn: &str, attr: &str, value: &str) -> anyhow::Result<()> {
+    // ---------- generic attribute modify -----------------------------------
+
+    /// Replace an attribute's value set (empty `values` clears the attribute).
+    pub fn modify_replace(&mut self, dn: &str, attr: &str, values: &[&str]) -> anyhow::Result<()> {
+        let set: HashSet<&str> = values.iter().copied().collect();
         self.conn
-            .modify(dn, vec![Mod::Replace(attr, HashSet::from([value]))])
-            .context("Modify replace failed")?
+            .modify(dn, vec![Mod::Replace(attr, set)])
+            .with_context(|| format!("Modify replace {attr} failed"))?
             .success()
-            .context("Modify replace rejected")?;
+            .with_context(|| format!("Modify replace {attr} rejected"))?;
+        Ok(())
+    }
+
+    /// Add values to an attribute (creating it if absent).
+    #[allow(dead_code)] // wired up by SSH-key add (P5)
+    pub fn modify_add(&mut self, dn: &str, attr: &str, values: &[&str]) -> anyhow::Result<()> {
+        let set: HashSet<&str> = values.iter().copied().collect();
+        self.conn
+            .modify(dn, vec![Mod::Add(attr, set)])
+            .with_context(|| format!("Modify add {attr} failed"))?
+            .success()
+            .with_context(|| format!("Modify add {attr} rejected"))?;
+        Ok(())
+    }
+
+    /// Delete an attribute entirely (empty `values`) or specific values.
+    #[allow(dead_code)] // wired up by SSH-key clear (P5)
+    pub fn modify_delete(&mut self, dn: &str, attr: &str, values: &[&str]) -> anyhow::Result<()> {
+        let set: HashSet<&str> = values.iter().copied().collect();
+        self.conn
+            .modify(dn, vec![Mod::Delete(attr, set)])
+            .with_context(|| format!("Modify delete {attr} failed"))?
+            .success()
+            .with_context(|| format!("Modify delete {attr} rejected"))?;
         Ok(())
     }
 

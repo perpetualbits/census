@@ -27,7 +27,6 @@ impl Session {
     }
 
     /// Re-read the user list from the directory.
-    #[allow(dead_code)] // wired up after the first user-mutating write (P4)
     pub fn refresh_users(&mut self) -> anyhow::Result<()> {
         self.users = self.client.list_users()?;
         Ok(())
