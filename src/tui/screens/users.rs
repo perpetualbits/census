@@ -19,7 +19,7 @@ pub fn render(app: &App, buf: &mut Buffer, focus: Pane) {
     if area.width < 20 || area.height < 5 { return; }
 
     mullion::border::draw_box(buf, area, Borders::ALL, &box_style());
-    btxt(buf, area.x + 2, area.y, "  census  ", s_title());
+    btxt(buf, area.x + 2, area.y, &format!("  census · {}  ", app.mode_tag()), s_title());
 
     let bottom = area.y + area.height - 1;
     match &app.status {

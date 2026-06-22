@@ -23,6 +23,11 @@ struct Args {
     #[arg(long)]
     write: bool,
 
+    /// Walk through every write flow but send nothing — each commit reports
+    /// the LDAP operation it *would* perform. Implies write-capable UI.
+    #[arg(long)]
+    dry_run: bool,
+
     /// Connect and exit; prints user and group counts. Useful for testing.
     #[arg(long)]
     ping: bool,
@@ -42,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let session = Session::connect(&cfg, password.as_deref(), "(default)".into())?;
-    tui::run(vec![session], allow_writes)
+    tui::run(vec![session], allow_writes, args.dry_run)
 }
 
 fn cmd_ping(cfg: &Config, password: Option<&str>, allow_writes: bool) -> anyhow::Result<()> {

@@ -43,13 +43,14 @@ pub struct App {
     overlay: Option<Overlay>,
     pub status:     Option<(String, bool)>,
     pub write_mode: bool,
+    pub dry_run:    bool,
 
     anim_start: Instant,
     anim_on: bool,
 }
 
 impl App {
-    fn new(sessions: Vec<Session>, write_mode: bool) -> Self {
+    fn new(sessions: Vec<Session>, write_mode: bool, dry_run: bool) -> Self {
         Self {
             sessions, active: 0, mode: Mode::Browse,
             users_cur: ListCursor::new(),
@@ -63,10 +64,20 @@ impl App {
             left_cur: ListCursor::new(),
             right_cur: ListCursor::new(),
             overlay: None,
-            status: None, write_mode,
+            status: None, write_mode, dry_run,
             anim_start: Instant::now(),
             anim_on: true,
         }
+    }
+
+    /// May the write UI be opened? True in `--write` or `--dry-run`.
+    fn can_write_ui(&self) -> bool { self.write_mode || self.dry_run }
+
+    /// Short label of the current write mode, for the title bar.
+    pub fn mode_tag(&self) -> &'static str {
+        if self.dry_run { "dry-run" }
+        else if self.write_mode { "write" }
+        else { "read-only" }
     }
 
     // ── active session ──────────────────────────────────────────────────────
@@ -125,9 +136,12 @@ impl App {
 
 // ─── entry point ─────────────────────────────────────────────────────────────
 
-pub fn run(sessions: Vec<Session>, write_mode: bool) -> anyhow::Result<()> {
-    let mut app = App::new(sessions, write_mode);
+pub fn run(sessions: Vec<Session>, write_mode: bool, dry_run: bool) -> anyhow::Result<()> {
+    let mut app = App::new(sessions, write_mode, dry_run);
     app.ensure_detail_loaded();
+    if dry_run {
+        app.status = Some(("dry-run: writes are simulated, nothing is sent".into(), false));
+    }
 
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     term.enter()?;
@@ -301,7 +315,7 @@ fn handle_key(
                 Pane::Right => app.right_cur.down(app.member_list().len()),
             },
             Enter => {
-                if !app.write_mode {
+                if !app.can_write_ui() {
                     app.status = Some(("Read-only — pass --write to modify".into(), true));
                 } else {
                     do_membership_action(app)?;
@@ -342,7 +356,7 @@ fn do_membership_action(app: &mut App) -> anyhow::Result<()> {
 
 /// Open the attribute-edit modal for the detail pane's selected target.
 fn open_attr_edit(app: &mut App) {
-    if !app.write_mode {
+    if !app.can_write_ui() {
         app.status = Some(("Read-only — pass --write to modify".into(), true));
         return;
     }
@@ -355,7 +369,7 @@ fn open_attr_edit(app: &mut App) {
 
 /// Open the SSH-key manager for the cursored user.
 fn open_key_editor(app: &mut App) {
-    if !app.write_mode {
+    if !app.can_write_ui() {
         app.status = Some(("Read-only — pass --write to modify".into(), true));
         return;
     }
@@ -366,7 +380,7 @@ fn open_key_editor(app: &mut App) {
 
 /// Open the set-password dialog for the cursored user.
 fn open_passwd(app: &mut App) {
-    if !app.write_mode {
+    if !app.can_write_ui() {
         app.status = Some(("Read-only — pass --write to modify".into(), true));
         return;
     }
@@ -377,7 +391,7 @@ fn open_passwd(app: &mut App) {
 
 /// Open the new-user form, seeded with the next free uidNumber.
 fn open_new_user(app: &mut App) {
-    if !app.write_mode {
+    if !app.can_write_ui() {
         app.status = Some(("Read-only — pass --write to modify".into(), true));
         return;
     }
@@ -387,7 +401,7 @@ fn open_new_user(app: &mut App) {
 
 /// Open a typed-DN delete confirmation for the user under the list cursor.
 fn open_delete_user(app: &mut App) {
-    if !app.write_mode {
+    if !app.can_write_ui() {
         app.status = Some(("Read-only — pass --write to modify".into(), true));
         return;
     }
@@ -401,7 +415,7 @@ fn open_delete_user(app: &mut App) {
 
 /// Open the new-group form, seeded with the next free gidNumber.
 fn open_new_group(app: &mut App) {
-    if !app.write_mode {
+    if !app.can_write_ui() {
         app.status = Some(("Read-only — pass --write to modify".into(), true));
         return;
     }
@@ -411,7 +425,7 @@ fn open_new_group(app: &mut App) {
 
 /// Open a typed-DN delete confirmation for the group under the cursor.
 fn open_delete_group(app: &mut App) {
-    if !app.write_mode {
+    if !app.can_write_ui() {
         app.status = Some(("Read-only — pass --write to modify".into(), true));
         return;
     }
@@ -425,11 +439,42 @@ fn open_delete_group(app: &mut App) {
 
 // ─── write chokepoint ─────────────────────────────────────────────────────────
 
+/// One-line description of the LDAP operation an action would perform (dry-run).
+fn describe_action(action: &Action) -> String {
+    match action {
+        Action::SetAttr { dn, attr, values } if values.is_empty() =>
+            format!("DELETE attr {attr} on {dn}"),
+        Action::SetAttr { dn, attr, values } =>
+            format!("MODIFY {attr}={} on {dn}", values.join(",")),
+        Action::SetKeys { dn, keys } =>
+            format!("REPLACE sshPublicKey ({} key(s)) on {dn}", keys.len()),
+        Action::AddMember { uid, group, .. } =>
+            format!("ADD memberUid {uid} to {group}"),
+        Action::DelMember { uid, group, .. } =>
+            format!("DELETE memberUid {uid} from {group}"),
+        Action::SetPasswd { dn, .. } =>
+            format!("SET password on {dn}"),
+        Action::CreateUser(s) =>
+            format!("ADD user uid={} (uidNumber={}, gid={})", s.uid, s.uid_number, s.gid_number),
+        Action::DeleteEntry { dn, .. } =>
+            format!("DELETE {dn}"),
+        Action::CreateGroup { name, gid_number } =>
+            format!("ADD group cn={name} (gidNumber={gid_number})"),
+        Action::DeleteGroup { dn, .. } =>
+            format!("DELETE {dn}"),
+    }
+}
+
 /// Execute a committed [`Action`]. The single place writes happen: gated on
 /// `--write`, then dispatched to the active session's client, then the affected
 /// caches are refreshed.
 fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
-    if !app.write_mode {
+    // Dry-run: report the LDAP operation that would be sent, change nothing.
+    if app.dry_run {
+        app.status = Some((format!("[dry-run] {}", describe_action(&action)), false));
+        return Ok(());
+    }
+    if !app.can_write_ui() {
         app.status = Some(("Read-only — pass --write to modify".into(), true));
         return Ok(());
     }
