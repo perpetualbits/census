@@ -283,39 +283,26 @@ fn handle_key(
 }
 
 fn do_membership_action(app: &mut App) -> anyhow::Result<()> {
-    let sel = app.selected_group;
+    let sel   = app.selected_group;
+    let group = app.groups()[sel].name.clone();
+    let dn    = app.groups()[sel].dn.clone();
     match app.active_pane {
         Pane::Left => {
-            let uid  = app.users()[app.left_cur.cursor].uid.clone();
-            let dn   = app.groups()[sel].dn.clone();
-            let name = app.groups()[sel].name.clone();
+            // Adding a member: no confirmation needed.
+            let uid = app.users()[app.left_cur.cursor].uid.clone();
             if app.member_uids().iter().any(|m| m == &uid) {
-                app.status = Some((format!("{uid} is already in {name}"), false));
+                app.status = Some((format!("{uid} is already in {group}"), false));
             } else {
-                let session = app.session_mut();
-                match session.client.group_add_member(&dn, &uid) {
-                    Ok(()) => {
-                        session.refresh_groups()?;
-                        app.status = Some((format!("Added {uid} to {name}"), false));
-                    }
-                    Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
-                }
+                perform(app, Action::AddMember { group_dn: dn, uid, group })?;
             }
         }
         Pane::Right => {
+            // Removing a member: confirm first.
             let members = app.member_list();
-            let uid = members.get(app.right_cur.cursor).map(|u| u.uid.clone());
-            if let Some(uid) = uid {
-                let dn   = app.groups()[sel].dn.clone();
-                let name = app.groups()[sel].name.clone();
-                let session = app.session_mut();
-                match session.client.group_remove_member(&dn, &uid) {
-                    Ok(()) => {
-                        session.refresh_groups()?;
-                        app.status = Some((format!("Removed {uid} from {name}"), false));
-                    }
-                    Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
-                }
+            if let Some(uid) = members.get(app.right_cur.cursor).map(|u| u.uid.clone()) {
+                let prompt = format!("Remove {uid} from {group}?");
+                let action = Action::DelMember { group_dn: dn, uid, group };
+                app.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::yes_no(prompt, action)));
             }
         }
     }
@@ -378,6 +365,26 @@ fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
                 Ok(()) => {
                     app.reload_detail_record();
                     app.status = Some((format!("Saved {n} ssh key(s)"), false));
+                }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            }
+        }
+        Action::AddMember { group_dn, uid, group } => {
+            let session = app.session_mut();
+            match session.client.group_add_member(&group_dn, &uid) {
+                Ok(()) => {
+                    session.refresh_groups()?;
+                    app.status = Some((format!("Added {uid} to {group}"), false));
+                }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            }
+        }
+        Action::DelMember { group_dn, uid, group } => {
+            let session = app.session_mut();
+            match session.client.group_remove_member(&group_dn, &uid) {
+                Ok(()) => {
+                    session.refresh_groups()?;
+                    app.status = Some((format!("Removed {uid} from {group}"), false));
                 }
                 Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
             }

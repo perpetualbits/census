@@ -5,20 +5,27 @@
 //! that the app's single `perform()` chokepoint executes (after the `--write`
 //! gate). Overlays never touch the `LdapClient` themselves.
 
+pub mod confirm;
 pub mod input;
 pub mod keys;
 
 use mullion::{Buffer, KeyCode, KeyModifiers, Rect};
 
+pub use confirm::ConfirmDialog;
 pub use input::InputDialog;
 pub use keys::KeyEditor;
 
 /// A write the user has requested. The app gates and executes these centrally.
+#[derive(Clone)]
 pub enum Action {
     /// Replace an attribute's values (empty = clear the attribute).
     SetAttr { dn: String, attr: String, values: Vec<String> },
     /// Replace the full set of SSH public keys (empty = clear).
     SetKeys { dn: String, keys: Vec<String> },
+    /// Add a user to a group's membership.
+    AddMember { group_dn: String, uid: String, group: String },
+    /// Remove a user from a group's membership.
+    DelMember { group_dn: String, uid: String, group: String },
 }
 
 /// What a modal asks the app to do after a keystroke.
@@ -35,20 +42,23 @@ pub enum OverlayResult {
 pub enum Overlay {
     Input(InputDialog),
     Keys(KeyEditor),
+    Confirm(ConfirmDialog),
 }
 
 impl Overlay {
     pub fn handle_key(&mut self, key: KeyCode, mods: KeyModifiers) -> OverlayResult {
         match self {
-            Overlay::Input(d) => d.handle_key(key, mods),
-            Overlay::Keys(d)  => d.handle_key(key, mods),
+            Overlay::Input(d)   => d.handle_key(key, mods),
+            Overlay::Keys(d)    => d.handle_key(key, mods),
+            Overlay::Confirm(d) => d.handle_key(key, mods),
         }
     }
 
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         match self {
-            Overlay::Input(d) => d.render(buf, area),
-            Overlay::Keys(d)  => d.render(buf, area),
+            Overlay::Input(d)   => d.render(buf, area),
+            Overlay::Keys(d)    => d.render(buf, area),
+            Overlay::Confirm(d) => d.render(buf, area),
         }
     }
 }
