@@ -237,6 +237,7 @@ fn handle_key(
                 if app.detail_cur + 1 < n { app.detail_cur += 1; }
             }
             (Pane::Right, Char('e')) => open_attr_edit(app),
+            (Pane::Right, Char('K')) => open_key_editor(app),
             _ => {}
         },
 
@@ -334,6 +335,17 @@ fn open_attr_edit(app: &mut App) {
     app.overlay = Some(Overlay::Input(dlg));
 }
 
+/// Open the SSH-key manager for the cursored user.
+fn open_key_editor(app: &mut App) {
+    if !app.write_mode {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let Some(user) = app.detail() else { return; };
+    let editor = overlay::KeyEditor::new(user.dn.clone(), user.ssh_keys.clone());
+    app.overlay = Some(Overlay::Keys(editor));
+}
+
 // ─── write chokepoint ─────────────────────────────────────────────────────────
 
 /// Execute a committed [`Action`]. The single place writes happen: gated on
@@ -356,6 +368,16 @@ fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
                         format!("Set {attr}")
                     };
                     app.status = Some((msg, false));
+                }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            }
+        }
+        Action::SetKeys { dn, keys } => {
+            let n = keys.len();
+            match app.session_mut().client.ssh_key_replace(&dn, &keys) {
+                Ok(()) => {
+                    app.reload_detail_record();
+                    app.status = Some((format!("Saved {n} ssh key(s)"), false));
                 }
                 Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
             }

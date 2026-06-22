@@ -198,7 +198,6 @@ impl LdapClient {
     }
 
     /// Add values to an attribute (creating it if absent).
-    #[allow(dead_code)] // wired up by SSH-key add (P5)
     pub fn modify_add(&mut self, dn: &str, attr: &str, values: &[&str]) -> anyhow::Result<()> {
         let set: HashSet<&str> = values.iter().copied().collect();
         self.conn
@@ -210,7 +209,7 @@ impl LdapClient {
     }
 
     /// Delete an attribute entirely (empty `values`) or specific values.
-    #[allow(dead_code)] // wired up by SSH-key clear (P5)
+    #[allow(dead_code)] // available for callers that need value-level deletes
     pub fn modify_delete(&mut self, dn: &str, attr: &str, values: &[&str]) -> anyhow::Result<()> {
         let set: HashSet<&str> = values.iter().copied().collect();
         self.conn
@@ -219,6 +218,35 @@ impl LdapClient {
             .success()
             .with_context(|| format!("Modify delete {attr} rejected"))?;
         Ok(())
+    }
+
+    /// Ensure `dn` has object class `oc`, adding it if absent.
+    pub fn ensure_object_class(&mut self, dn: &str, oc: &str) -> anyhow::Result<()> {
+        let (rs, _) = self.conn
+            .search(dn, Scope::Base, "(objectClass=*)", vec!["objectClass"])
+            .context("Read objectClass failed")?
+            .success()
+            .context("Read objectClass rejected")?;
+        let has = rs.into_iter().next().is_some_and(|e| {
+            SearchEntry::construct(e).attrs.get("objectClass")
+                .is_some_and(|v| v.iter().any(|c| c.eq_ignore_ascii_case(oc)))
+        });
+        if !has {
+            self.modify_add(dn, "objectClass", &[oc])?;
+        }
+        Ok(())
+    }
+
+    /// Replace the full set of SSH public keys (empty list clears them).
+    /// Ensures the key object class is present before adding any keys.
+    pub fn ssh_key_replace(&mut self, dn: &str, keys: &[String]) -> anyhow::Result<()> {
+        let attr = self.schema.ssh_key;          // &'static str — no borrow of self
+        let oc   = self.schema.ssh_object_class;
+        if !keys.is_empty() {
+            self.ensure_object_class(dn, oc)?;
+        }
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        self.modify_replace(dn, attr, &refs)
     }
 
     pub fn close(mut self) -> anyhow::Result<()> {

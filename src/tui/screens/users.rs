@@ -29,7 +29,7 @@ pub fn render(app: &App, buf: &mut Buffer, focus: Pane) {
         }
         None => {
             let hint = if focus == Pane::Right {
-                " Tab:pane  ↑↓/jk:attr  e:edit  g:groups  q:quit "
+                " Tab:pane  ↑↓/jk:attr  e:edit  K:keys  g:groups  q:quit "
             } else {
                 " Tab:pane  g:groups  ↑↓/jk:users  q:quit "
             };

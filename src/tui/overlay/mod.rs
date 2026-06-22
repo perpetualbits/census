@@ -6,15 +6,19 @@
 //! gate). Overlays never touch the `LdapClient` themselves.
 
 pub mod input;
+pub mod keys;
 
 use mullion::{Buffer, KeyCode, KeyModifiers, Rect};
 
 pub use input::InputDialog;
+pub use keys::KeyEditor;
 
 /// A write the user has requested. The app gates and executes these centrally.
 pub enum Action {
     /// Replace an attribute's values (empty = clear the attribute).
     SetAttr { dn: String, attr: String, values: Vec<String> },
+    /// Replace the full set of SSH public keys (empty = clear).
+    SetKeys { dn: String, keys: Vec<String> },
 }
 
 /// What a modal asks the app to do after a keystroke.
@@ -30,18 +34,21 @@ pub enum OverlayResult {
 /// The set of modal dialogs. One is active at a time via `App::overlay`.
 pub enum Overlay {
     Input(InputDialog),
+    Keys(KeyEditor),
 }
 
 impl Overlay {
     pub fn handle_key(&mut self, key: KeyCode, mods: KeyModifiers) -> OverlayResult {
         match self {
             Overlay::Input(d) => d.handle_key(key, mods),
+            Overlay::Keys(d)  => d.handle_key(key, mods),
         }
     }
 
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         match self {
             Overlay::Input(d) => d.render(buf, area),
+            Overlay::Keys(d)  => d.render(buf, area),
         }
     }
 }
