@@ -1,5 +1,7 @@
 mod config;
 mod ldap;
+mod schema;
+mod session;
 mod tui;
 
 use std::path::PathBuf;
@@ -8,6 +10,7 @@ use clap::Parser;
 
 use config::Config;
 use ldap::LdapClient;
+use session::Session;
 
 #[derive(Parser, Debug)]
 #[command(name = "census", about = "LDAP user and group administration TUI")]
@@ -38,10 +41,8 @@ fn main() -> anyhow::Result<()> {
         return cmd_ping(&cfg, password.as_deref(), allow_writes);
     }
 
-    let mut client = LdapClient::connect(&cfg, password.as_deref())?;
-    let result = tui::run(&mut client, &cfg, allow_writes);
-    client.close().ok();
-    result
+    let session = Session::connect(&cfg, password.as_deref(), "(default)".into())?;
+    tui::run(vec![session], allow_writes)
 }
 
 fn cmd_ping(cfg: &Config, password: Option<&str>, allow_writes: bool) -> anyhow::Result<()> {

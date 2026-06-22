@@ -3,11 +3,13 @@ use ldap3::{LdapConn, LdapConnSettings, Mod, Scope, SearchEntry};
 use std::collections::{HashMap, HashSet};
 
 use crate::config::{Config, TunnelConfig};
+use crate::schema::Schema;
 use super::tunnel::{self, Tunnel};
 
 pub struct LdapClient {
     conn: LdapConn,
     pub base_dn: String,
+    schema: Schema,
     _tunnel: Option<Tunnel>,
 }
 
@@ -70,9 +72,14 @@ impl LdapClient {
         Ok(Self {
             conn,
             base_dn: cfg.server.base_dn.clone(),
+            schema: Schema::rfc2307(),
             _tunnel: tun,
         })
     }
+
+    /// The directory schema this client is bound to.
+    #[allow(dead_code)] // consumed by the detail/edit views (P2/P4)
+    pub fn schema(&self) -> &Schema { &self.schema }
 
     pub fn ping(&mut self) -> anyhow::Result<()> {
         // A BASE search on the root DSE is a lightweight connectivity check.
@@ -88,40 +95,34 @@ impl LdapClient {
     // ---------- users -------------------------------------------------------
 
     pub fn list_users(&mut self) -> anyhow::Result<Vec<User>> {
-        let base = format!("ou=users,{}", self.base_dn);
-        let attrs = vec!["uid", "cn", "sn", "givenName", "uidNumber", "gidNumber",
-                         "homeDirectory", "loginShell", "sshPublicKey"];
+        let s = &self.schema;
+        let base = s.user_base(&self.base_dn);
+        let attrs = vec![s.uid, s.cn, s.sn, s.given_name, s.uid_number, s.gid_number,
+                         s.home, s.shell, s.ssh_key];
         let (rs, _) = self.conn
-            .search(&base, Scope::OneLevel, "(objectClass=posixAccount)", attrs)
+            .search(&base, Scope::OneLevel, s.user_filter, attrs)
             .context("User search failed")?
             .success()
             .context("User search rejected")?;
 
+        let s = self.schema.clone();
         let mut users = Vec::new();
         for entry in rs {
             let e = SearchEntry::construct(entry);
-            let uid = first(&e, "uid").unwrap_or_default();
-            if uid.is_empty() { continue; }
-            users.push(User {
-                dn: e.dn.clone(),
-                uid,
-                cn: first(&e, "cn").unwrap_or_default(),
-                uid_number: first(&e, "uidNumber").and_then(|s| s.parse().ok()).unwrap_or(0),
-                gid_number: first(&e, "gidNumber").and_then(|s| s.parse().ok()).unwrap_or(0),
-                home: first(&e, "homeDirectory").unwrap_or_default(),
-                shell: first(&e, "loginShell").unwrap_or_default(),
-                ssh_keys: e.attrs.get("sshPublicKey").cloned().unwrap_or_default(),
-                attrs: e.attrs,
-            });
+            if let Some(user) = user_from_entry(e, &s) {
+                users.push(user);
+            }
         }
         users.sort_by(|a, b| a.uid.cmp(&b.uid));
         Ok(users)
     }
 
-    #[allow(dead_code)] // detail-view lookup; wired up when per-user view lands
+    /// Fetch a single user with all attributes (`*` + operational `+`).
+    #[allow(dead_code)] // wired up by the detail view (P2)
     pub fn get_user(&mut self, uid: &str) -> anyhow::Result<Option<User>> {
-        let base = format!("ou=users,{}", self.base_dn);
-        let filter = format!("(uid={uid})");
+        let s = &self.schema;
+        let base = s.user_base(&self.base_dn);
+        let filter = format!("({}={})", s.uid, ldap3::ldap_escape(uid));
         let attrs = vec!["*", "+"];
         let (rs, _) = self.conn
             .search(&base, Scope::OneLevel, &filter, attrs)
@@ -129,43 +130,35 @@ impl LdapClient {
             .success()
             .context("User search rejected")?;
 
-        Ok(rs.into_iter().next().map(|entry| {
-            let e = SearchEntry::construct(entry);
-            User {
-                dn: e.dn.clone(),
-                uid: first(&e, "uid").unwrap_or_default(),
-                cn: first(&e, "cn").unwrap_or_default(),
-                uid_number: first(&e, "uidNumber").and_then(|s| s.parse().ok()).unwrap_or(0),
-                gid_number: first(&e, "gidNumber").and_then(|s| s.parse().ok()).unwrap_or(0),
-                home: first(&e, "homeDirectory").unwrap_or_default(),
-                shell: first(&e, "loginShell").unwrap_or_default(),
-                ssh_keys: e.attrs.get("sshPublicKey").cloned().unwrap_or_default(),
-                attrs: e.attrs,
-            }
-        }))
+        let s = self.schema.clone();
+        Ok(rs.into_iter()
+            .next()
+            .and_then(|entry| user_from_entry(SearchEntry::construct(entry), &s)))
     }
 
     // ---------- groups ------------------------------------------------------
 
     pub fn list_groups(&mut self) -> anyhow::Result<Vec<Group>> {
-        let base = format!("ou=groups,{}", self.base_dn);
-        let attrs = vec!["cn", "gidNumber", "memberUid"];
+        let s = &self.schema;
+        let base = s.group_base(&self.base_dn);
+        let attrs = vec![s.cn, s.gid_number, s.member];
         let (rs, _) = self.conn
-            .search(&base, Scope::OneLevel, "(objectClass=posixGroup)", attrs)
+            .search(&base, Scope::OneLevel, s.group_filter, attrs)
             .context("Group search failed")?
             .success()
             .context("Group search rejected")?;
 
+        let s = &self.schema;
         let mut groups = Vec::new();
         for entry in rs {
             let e = SearchEntry::construct(entry);
-            let name = first(&e, "cn").unwrap_or_default();
+            let name = first(&e, s.cn).unwrap_or_default();
             if name.is_empty() { continue; }
             groups.push(Group {
                 dn: e.dn.clone(),
                 name,
-                gid_number: first(&e, "gidNumber").and_then(|s| s.parse().ok()).unwrap_or(0),
-                members: e.attrs.get("memberUid").cloned().unwrap_or_default(),
+                gid_number: first(&e, s.gid_number).and_then(|s| s.parse().ok()).unwrap_or(0),
+                members: e.attrs.get(s.member).cloned().unwrap_or_default(),
             });
         }
         groups.sort_by(|a, b| a.name.cmp(&b.name));
@@ -212,6 +205,24 @@ impl LdapClient {
 
 fn first(entry: &SearchEntry, attr: &str) -> Option<String> {
     entry.attrs.get(attr)?.first().cloned()
+}
+
+/// Build a [`User`] from a search entry, reading attribute names from `schema`.
+/// Returns `None` when the entry has no RDN value (cannot identify the user).
+fn user_from_entry(e: SearchEntry, schema: &Schema) -> Option<User> {
+    let uid = first(&e, schema.uid).unwrap_or_default();
+    if uid.is_empty() { return None; }
+    Some(User {
+        dn: e.dn.clone(),
+        uid,
+        cn: first(&e, schema.cn).unwrap_or_default(),
+        uid_number: first(&e, schema.uid_number).and_then(|s| s.parse().ok()).unwrap_or(0),
+        gid_number: first(&e, schema.gid_number).and_then(|s| s.parse().ok()).unwrap_or(0),
+        home: first(&e, schema.home).unwrap_or_default(),
+        shell: first(&e, schema.shell).unwrap_or_default(),
+        ssh_keys: e.attrs.get(schema.ssh_key).cloned().unwrap_or_default(),
+        attrs: e.attrs,
+    })
 }
 
 fn resolve_endpoint(cfg: &Config) -> anyhow::Result<(String, u16, Option<Tunnel>)> {

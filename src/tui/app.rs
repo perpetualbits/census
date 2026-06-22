@@ -5,8 +5,8 @@ use std::time::Duration;
 use crossterm::event::Event;
 use mullion::{backend::CrosstermBackend, poll_event, Buffer, KeyCode, KeyModifiers, Rect, Terminal};
 
-use crate::config::Config;
-use crate::ldap::client::{Group, LdapClient, User};
+use crate::ldap::client::{Group, User};
+use crate::session::Session;
 
 use super::focus::{ListCursor, Pane};
 use super::screens;
@@ -17,9 +17,9 @@ use super::screens;
 enum Mode { Browse, GroupSelect, Membership }
 
 pub struct App {
-    users:  Vec<User>,
-    groups: Vec<Group>,
-    mode:   Mode,
+    sessions: Vec<Session>,
+    active:   usize,
+    mode:     Mode,
 
     pub users_cur:  ListCursor,
     pub groups_cur: ListCursor,
@@ -31,34 +31,35 @@ pub struct App {
 
     pub status:     Option<(String, bool)>,
     pub write_mode: bool,
-
-    // precomputed: user index → group names that user belongs to
-    user_groups: Vec<Vec<String>>,
 }
 
 impl App {
-    fn new(users: Vec<User>, groups: Vec<Group>, write_mode: bool) -> Self {
-        let user_groups = build_user_groups(&users, &groups);
+    fn new(sessions: Vec<Session>, write_mode: bool) -> Self {
         Self {
-            users, groups, mode: Mode::Browse,
+            sessions, active: 0, mode: Mode::Browse,
             users_cur: ListCursor::new(),
             groups_cur: ListCursor::new(),
             selected_group: 0,
             active_pane: Pane::Left,
             left_cur: ListCursor::new(),
             right_cur: ListCursor::new(),
-            status: None, write_mode, user_groups,
+            status: None, write_mode,
         }
     }
 
+    // ── active session ──────────────────────────────────────────────────────
+
+    fn session(&self) -> &Session { &self.sessions[self.active] }
+    fn session_mut(&mut self) -> &mut Session { &mut self.sessions[self.active] }
+
     // ── accessors used by the screen renderers ──────────────────────────────
 
-    pub fn users(&self) -> &[User] { &self.users }
-    pub fn groups(&self) -> &[Group] { &self.groups }
-    pub fn user_groups(&self) -> &[Vec<String>] { &self.user_groups }
+    pub fn users(&self) -> &[User] { &self.session().users }
+    pub fn groups(&self) -> &[Group] { &self.session().groups }
+    pub fn user_groups(&self) -> &[Vec<String>] { &self.session().user_groups }
 
     pub fn selected_group(&self) -> Option<&Group> {
-        self.groups.get(self.selected_group)
+        self.groups().get(self.selected_group)
     }
 
     pub fn member_uids(&self) -> &[String] {
@@ -67,49 +68,35 @@ impl App {
 
     /// Members of the selected group, resolved to `User`s in `memberUid` order.
     pub fn member_list(&self) -> Vec<&User> {
+        let users = self.users();
         self.member_uids().iter()
-            .filter_map(|uid| self.users.iter().find(|u| &u.uid == uid))
+            .filter_map(|uid| users.iter().find(|u| &u.uid == uid))
             .collect()
     }
-
-    // ── refresh ─────────────────────────────────────────────────────────────
-
-    fn refresh_groups(&mut self, client: &mut LdapClient) -> anyhow::Result<()> {
-        self.groups = client.list_groups()?;
-        self.user_groups = build_user_groups(&self.users, &self.groups);
-        Ok(())
-    }
-}
-
-fn build_user_groups(users: &[User], groups: &[Group]) -> Vec<Vec<String>> {
-    users.iter().map(|u| {
-        groups.iter()
-            .filter(|g| g.members.iter().any(|m| m == &u.uid))
-            .map(|g| g.name.clone())
-            .collect()
-    }).collect()
 }
 
 // ─── entry point ─────────────────────────────────────────────────────────────
 
-pub fn run(client: &mut LdapClient, _cfg: &Config, write_mode: bool) -> anyhow::Result<()> {
-    let users  = client.list_users()?;
-    let groups = client.list_groups()?;
-    let mut app = App::new(users, groups, write_mode);
+pub fn run(sessions: Vec<Session>, write_mode: bool) -> anyhow::Result<()> {
+    let mut app = App::new(sessions, write_mode);
 
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     term.enter()?;
-    let result = main_loop(&mut term, &mut app, client);
+    let result = main_loop(&mut term, &mut app);
     term.leave()?;
+
+    // Unbind every session regardless of how the loop ended.
+    for session in app.sessions {
+        session.close().ok();
+    }
     result
 }
 
 // ─── event loop ──────────────────────────────────────────────────────────────
 
 fn main_loop(
-    term:   &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    app:    &mut App,
-    client: &mut LdapClient,
+    term: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app:  &mut App,
 ) -> anyhow::Result<()> {
     loop {
         term.draw(|buf| {
@@ -120,7 +107,7 @@ fn main_loop(
         match poll_event(Duration::from_millis(100))? {
             None => continue,
             Some(Event::Key(key)) => {
-                if handle_key(app, client, key.code, key.modifiers)? {
+                if handle_key(app, key.code, key.modifiers)? {
                     return Ok(());
                 }
             }
@@ -147,10 +134,9 @@ fn update_offsets(app: &mut App, area: Rect) {
 // ─── key handling ────────────────────────────────────────────────────────────
 
 fn handle_key(
-    app:    &mut App,
-    client: &mut LdapClient,
-    key:    KeyCode,
-    mods:   KeyModifiers,
+    app:  &mut App,
+    key:  KeyCode,
+    mods: KeyModifiers,
 ) -> anyhow::Result<bool> {
     use KeyCode::*;
 
@@ -163,16 +149,16 @@ fn handle_key(
             Char('q') | Esc => return Ok(true),
             Char('g') => { app.mode = Mode::GroupSelect; app.groups_cur.reset(); }
             Up   | Char('k') => app.users_cur.up(),
-            Down | Char('j') => app.users_cur.down(app.users.len()),
-            PageUp   => app.users_cur.page(-10, app.users.len()),
-            PageDown => app.users_cur.page(10, app.users.len()),
+            Down | Char('j') => app.users_cur.down(app.users().len()),
+            PageUp   => app.users_cur.page(-10, app.users().len()),
+            PageDown => app.users_cur.page(10, app.users().len()),
             _ => {}
         },
 
         Mode::GroupSelect => match key {
             Esc => { app.mode = Mode::Browse; }
             Up   | Char('k') => app.groups_cur.up(),
-            Down | Char('j') => app.groups_cur.down(app.groups.len()),
+            Down | Char('j') => app.groups_cur.down(app.groups().len()),
             Enter => {
                 app.selected_group = app.groups_cur.cursor;
                 app.mode = Mode::Membership;
@@ -194,14 +180,14 @@ fn handle_key(
                 Pane::Right => app.right_cur.up(),
             },
             Down | Char('j') => match app.active_pane {
-                Pane::Left  => app.left_cur.down(app.users.len()),
+                Pane::Left  => app.left_cur.down(app.users().len()),
                 Pane::Right => app.right_cur.down(app.member_list().len()),
             },
             Enter => {
                 if !app.write_mode {
                     app.status = Some(("Read-only — pass --write to modify".into(), true));
                 } else {
-                    do_membership_action(app, client)?;
+                    do_membership_action(app)?;
                 }
             }
             _ => {}
@@ -210,18 +196,20 @@ fn handle_key(
     Ok(false)
 }
 
-fn do_membership_action(app: &mut App, client: &mut LdapClient) -> anyhow::Result<()> {
+fn do_membership_action(app: &mut App) -> anyhow::Result<()> {
+    let sel = app.selected_group;
     match app.active_pane {
         Pane::Left => {
-            let uid  = app.users[app.left_cur.cursor].uid.clone();
-            let dn   = app.groups[app.selected_group].dn.clone();
-            let name = app.groups[app.selected_group].name.clone();
+            let uid  = app.users()[app.left_cur.cursor].uid.clone();
+            let dn   = app.groups()[sel].dn.clone();
+            let name = app.groups()[sel].name.clone();
             if app.member_uids().iter().any(|m| m == &uid) {
                 app.status = Some((format!("{uid} is already in {name}"), false));
             } else {
-                match client.group_add_member(&dn, &uid) {
+                let session = app.session_mut();
+                match session.client.group_add_member(&dn, &uid) {
                     Ok(()) => {
-                        app.refresh_groups(client)?;
+                        session.refresh_groups()?;
                         app.status = Some((format!("Added {uid} to {name}"), false));
                     }
                     Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
@@ -230,13 +218,14 @@ fn do_membership_action(app: &mut App, client: &mut LdapClient) -> anyhow::Resul
         }
         Pane::Right => {
             let members = app.member_list();
-            if let Some(user) = members.get(app.right_cur.cursor) {
-                let uid  = user.uid.clone();
-                let dn   = app.groups[app.selected_group].dn.clone();
-                let name = app.groups[app.selected_group].name.clone();
-                match client.group_remove_member(&dn, &uid) {
+            let uid = members.get(app.right_cur.cursor).map(|u| u.uid.clone());
+            if let Some(uid) = uid {
+                let dn   = app.groups()[sel].dn.clone();
+                let name = app.groups()[sel].name.clone();
+                let session = app.session_mut();
+                match session.client.group_remove_member(&dn, &uid) {
                     Ok(()) => {
-                        app.refresh_groups(client)?;
+                        session.refresh_groups()?;
                         app.status = Some((format!("Removed {uid} from {name}"), false));
                     }
                     Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
