@@ -82,6 +82,7 @@ impl PasswdDialog {
         btxt(buf, rect.x + 2, rect.y + 5, msg, sty);
     }
 
+    #[allow(clippy::too_many_arguments)] // a private render helper; args are all positional draw params
     fn field_line(&self, buf: &mut Buffer, x: u16, y: u16, w: u16, label: &str, val: &[char], active: bool) {
         let lab = format!("{label:>8}: ");
         let lab_sty = if active { s_subhead() } else { s_dim() };

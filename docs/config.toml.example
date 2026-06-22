@@ -3,9 +3,10 @@
 # Copy to ~/.config/census/config.toml and fill in your real values.
 # Keep that file out of version control.
 #
-# Password is NEVER stored here.
-# Set env var:  export CENSUS_BIND_PASSWORD="secret"
-# Or census will prompt interactively on startup.
+# The bind password is NEVER stored here. In order of preference census uses:
+#   1. password_cmd below (e.g. a secrets manager such as rbw / pass)
+#   2. env var:  export CENSUS_BIND_PASSWORD="secret"
+#   3. an interactive prompt on startup
 
 [server]
 host      = "ldap.example.com"        # LDAP server hostname
@@ -14,8 +15,14 @@ use_ssl   = true                       # true → LDAPS  (port 636 typically)
 start_tls = false                      # true → plain LDAP + STARTTLS (port 389)
 base_dn   = "dc=example,dc=com"
 bind_dn   = "cn=admin,dc=example,dc=com"
+# password_cmd = "rbw get 'My LDAP'"   # stdout is used as the bind password
 # sni     = "ldap.example.com"        # TLS SNI override (default: host)
 verify    = true                       # require valid TLS certificate
+
+# How password changes are written:
+#   "exop"  → RFC 3062 Password Modify; the server hashes per its policy (default)
+#   "crypt" → census writes userPassword: {CRYPT}$6$… (client-side SHA-512)
+# password_scheme = "exop"
 
 [tunnel]
 # SSH local-forward tunnel.  census will reuse an existing -L forward if one

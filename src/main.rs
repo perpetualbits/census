@@ -71,9 +71,8 @@ fn cmd_ping(cfg: &Config, password: Option<&str>, allow_writes: bool) -> anyhow:
 }
 
 fn get_password(cfg: &Config) -> Option<String> {
-    if cfg.server.bind_dn.is_none() {
-        return None;
-    }
+    // No bind DN → anonymous bind, no password needed.
+    cfg.server.bind_dn.as_ref()?;
     // 1. password_cmd in config (e.g. rbw get "...")
     if let Some(cmd) = &cfg.server.password_cmd {
         match run_password_cmd(cmd) {

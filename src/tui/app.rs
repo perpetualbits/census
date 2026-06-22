@@ -219,7 +219,10 @@ fn handle_key(
 
     match app.mode {
         Mode::Browse => match (app.browse_focus, key) {
-            (_, Char('q')) | (_, Esc) => return Ok(true),
+            (_, Char('q')) => return Ok(true),
+            // Esc steps focus back to the list, then quits.
+            (Pane::Right, Esc) => app.browse_focus = Pane::Left,
+            (Pane::Left,  Esc) => return Ok(true),
             (_, Char('g')) => { app.mode = Mode::GroupSelect; app.groups_cur.reset(); }
             (_, Char('n')) => open_new_user(app),
             (_, Char('D')) => open_delete_user(app),

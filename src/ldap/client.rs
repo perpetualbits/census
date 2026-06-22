@@ -397,9 +397,7 @@ fn resolve_endpoint(cfg: &Config) -> anyhow::Result<(String, u16, Option<Tunnel>
         return Ok((cfg.server.host.clone(), cfg.server.port, None));
     }
 
-    let ssh_alias = tc.ssh_alias.as_deref()
-        .or(Some(cfg.server.host.as_str()))
-        .unwrap();
+    let ssh_alias = tc.ssh_alias.as_deref().unwrap_or(cfg.server.host.as_str());
     let remote_host = tc.remote_host.as_deref().unwrap_or(&cfg.server.host);
     let remote_port = tc.remote_port.unwrap_or(cfg.server.port);
 
