@@ -29,6 +29,8 @@ pub struct Schema {
     pub home: &'static str,
     pub shell: &'static str,
     pub ssh_key: &'static str,
+    /// Binary portrait attribute (`jpegPhoto`, from inetOrgPerson / RFC 2798).
+    pub photo: &'static str,
     /// Group membership attribute (bare UIDs for RFC 2307 `memberUid`).
     pub member: &'static str,
 
@@ -56,6 +58,7 @@ impl Schema {
             home: "homeDirectory",
             shell: "loginShell",
             ssh_key: "sshPublicKey",
+            photo: "jpegPhoto",
             member: "memberUid",
             user_object_classes: &["top", "posixAccount", "inetOrgPerson", "shadowAccount"],
             ssh_object_class: "ldapPublicKey",

@@ -1,24 +1,43 @@
 //! Browse screen: user list (left) beside a per-user detail pane (right).
 
 use mullion::{
-    border::Borders,
     label::Align,
+    render_shared,
     table::{ColumnDef, ColumnGrid, ColumnKind},
-    Buffer, Rect,
+    Buffer, Constraint, LineWeight, Node, Orientation, Rect, Size,
 };
 
 use crate::tui::app::App;
-use crate::tui::draw::{btxt, fill_row, hline, inset};
+use crate::tui::draw::{btxt, fill_row, hline};
 use crate::tui::focus::Pane;
 use crate::tui::theme::*;
 
 use super::detail;
 
+/// Stable tile ids for the browse layout.
+const LIST: u64 = 1;
+const DETAIL: u64 = 2;
+
 pub fn render(app: &App, buf: &mut Buffer, focus: Pane) {
     let area = buf.area;
     if area.width < 20 || area.height < 5 { return; }
 
-    mullion::border::draw_box(buf, area, Borders::ALL, &box_style());
+    // List pane (left) beside the detail pane (right). The engine draws the
+    // outer frame and the shared divider (with junctions) for us; the focused
+    // pane's border is thickened to a heavy weight.
+    let mut tree = Node::Split {
+        orientation: Orientation::Horizontal,
+        children: vec![
+            (Constraint::new(Size::Percent(40)).with_min(20).with_max(44), Node::Tile(LIST)),
+            (Constraint::new(Size::Fill(1)), Node::Tile(DETAIL)),
+        ],
+    };
+    let focused = if focus == Pane::Left { LIST } else { DETAIL };
+    let rects = render_shared(
+        buf, &mut tree, area, &box_style(),
+        &[(focused, LineWeight::Heavy)],
+    );
+
     btxt(buf, area.x + 2, area.y, &format!("  census · {}  ", app.mode_tag()), s_title());
 
     let bottom = area.y + area.height - 1;
@@ -40,24 +59,13 @@ pub fn render(app: &App, buf: &mut Buffer, focus: Pane) {
         }
     }
 
-    let inner = inset(area, 1);
-    if inner.height < 3 || inner.width < 12 { return; }
-
-    // Split: list pane on the left, detail on the right.
-    let list_w = (inner.width * 2 / 5).clamp(20, 44).min(inner.width.saturating_sub(12));
-    let div_x  = inner.x + list_w;
-
-    btxt(buf, div_x, area.y, "┬", s_border());
-    for y in inner.y..inner.y + inner.height {
-        btxt(buf, div_x, y, "│", s_border());
+    for (id, r) in rects {
+        match id {
+            LIST   => render_list(app, buf, r, focus == Pane::Left),
+            DETAIL => detail::render(app, buf, r, focus == Pane::Right),
+            _ => {}
+        }
     }
-    btxt(buf, div_x, area.y + area.height - 1, "┴", s_border());
-
-    let list_area   = Rect::new(inner.x, inner.y, list_w, inner.height);
-    let detail_area = Rect::new(div_x + 1, inner.y, inner.width.saturating_sub(list_w + 1), inner.height);
-
-    render_list(app, buf, list_area, focus == Pane::Left);
-    detail::render(app, buf, detail_area, focus == Pane::Right);
 }
 
 fn render_list(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {

@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::Event;
-use mullion::{backend::CrosstermBackend, poll_event, Buffer, KeyCode, KeyModifiers, Rect, Terminal};
+use mullion::{backend::CrosstermBackend, Buffer, EventReader, KeyCode, KeyModifiers, Rect, Terminal};
 
 use crate::ldap::client::{Group, User};
 use crate::session::Session;
@@ -34,6 +34,7 @@ pub struct App {
     pub detail_scroll: usize,
     pub detail_cur: usize,       // index into the detail pane's editable targets
     detail: Option<User>,        // full record of the cursored user (lazy-loaded)
+    detail_photo: Option<mullion::video::Frame>, // decoded jpegPhoto for `detail`
 
     selected_group: usize,
     pub active_pane: Pane,
@@ -59,6 +60,7 @@ impl App {
             detail_scroll: 0,
             detail_cur: 0,
             detail: None,
+            detail_photo: None,
             selected_group: 0,
             active_pane: Pane::Left,
             left_cur: ListCursor::new(),
@@ -92,6 +94,18 @@ impl App {
 
     pub fn detail(&self) -> Option<&User> { self.detail.as_ref() }
 
+    /// The decoded portrait for the cursored user, if it carries a `jpegPhoto`.
+    pub fn detail_photo(&self) -> Option<&mullion::video::Frame> { self.detail_photo.as_ref() }
+
+    /// Set the detail record and (re)decode its portrait in one place, so the cached
+    /// photo never drifts from the user it belongs to.
+    fn load_detail(&mut self, user: Option<User>) {
+        self.detail_photo = user.as_ref()
+            .and_then(|u| u.photo.as_deref())
+            .and_then(super::photo::decode);
+        self.detail = user;
+    }
+
     /// Names of the groups `uid` belongs to (active session).
     pub fn groups_of(&self, uid: &str) -> Vec<String> {
         self.groups().iter()
@@ -123,12 +137,12 @@ impl App {
 
     /// Fetch the full record for the cursored user if it isn't already loaded.
     fn ensure_detail_loaded(&mut self) {
-        let Some(uid) = self.cursor_uid() else { self.detail = None; return; };
+        let Some(uid) = self.cursor_uid() else { self.load_detail(None); return; };
         if self.detail.as_ref().map(|u| u.uid.as_str()) == Some(uid.as_str()) {
             return;
         }
         match self.session_mut().client.get_user(&uid) {
-            Ok(full) => { self.detail = full; self.detail_scroll = 0; self.detail_cur = 0; }
+            Ok(full) => { self.load_detail(full); self.detail_scroll = 0; self.detail_cur = 0; }
             Err(e)   => { self.status = Some((format!("detail load failed: {e}"), true)); }
         }
     }
@@ -161,24 +175,35 @@ fn main_loop(
     term: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app:  &mut App,
 ) -> anyhow::Result<()> {
+    // A background reader decouples input capture from the render cadence, so a
+    // burst of keys is consumed in one frame and never blocked by a slow draw.
+    let input = EventReader::new();
     loop {
         term.draw(|buf| {
             update_offsets(app, buf.area);
             render(app, buf);
         })?;
 
-        // Cap the wait so the border glow keeps animating while idle.
+        // Cap the idle wait so the border glow keeps animating between events.
         let wait = if app.anim_on { RENDER_TICK } else { Duration::from_millis(100) };
-        match poll_event(wait)? {
-            None => continue,
-            Some(Event::Key(key)) => {
-                if handle_key(app, key.code, key.modifiers)? {
-                    return Ok(());
-                }
-            }
-            Some(Event::Resize(..)) => {}
-            Some(_) => {}
+        let Some(first) = input.recv_timeout(wait) else { continue };
+        if dispatch(app, first)? {
+            return Ok(());
         }
+        // Drain the rest of any burst before the next redraw.
+        for ev in input.drain() {
+            if dispatch(app, ev)? {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Route one captured event to the key handler; returns `true` to quit.
+fn dispatch(app: &mut App, ev: Event) -> anyhow::Result<bool> {
+    match ev {
+        Event::Key(key) => handle_key(app, key.code, key.modifiers),
+        _ => Ok(false),
     }
 }
 
@@ -187,16 +212,21 @@ fn update_offsets(app: &mut App, area: Rect) {
     let vis = area.height.saturating_sub(4) as usize;
     if vis == 0 { return; }
 
-    app.users_cur.keep_in_view(vis);
-    app.groups_cur.keep_in_view(vis);
-    app.left_cur.keep_in_view(vis);
+    let nusers = app.users().len();
+    let ngroups = app.groups().len();
+    app.users_cur.keep_in_view(nusers, vis);
+    app.groups_cur.keep_in_view(ngroups, vis);
+    app.left_cur.keep_in_view(nusers, vis);
 
     let rlen = app.member_uids().len();
     app.right_cur.clamp(rlen);
-    app.right_cur.keep_in_view(vis);
+    app.right_cur.keep_in_view(rlen, vis);
 
-    // Detail body height = inner(area-2) - header(1) - sep(1) = vis - 2.
-    let detail_vis = vis.saturating_sub(2).max(1);
+    // Detail body height = inner(area-2) - header(1) - sep(1) = vis - 2, minus the
+    // portrait band (photo rows + a gap) when the cursored user has a jpegPhoto.
+    let prows = screens::detail::photo_rows(app, vis as u16) as usize;
+    let photo_off = if prows > 0 { prows + 1 } else { 0 };
+    let detail_vis = vis.saturating_sub(2).saturating_sub(photo_off).max(1);
 
     // Keep the selected editable attribute (right pane) within the body.
     if app.mode == Mode::Browse && app.browse_focus == Pane::Right {
@@ -581,7 +611,7 @@ impl App {
     fn reload_detail_record(&mut self) {
         if let Some(uid) = self.cursor_uid() {
             if let Ok(full) = self.session_mut().client.get_user(&uid) {
-                self.detail = full;
+                self.load_detail(full);
             }
         }
         let _ = self.session_mut().refresh_users();
@@ -592,7 +622,7 @@ impl App {
         if let Some(i) = self.users().iter().position(|u| u.uid == uid) {
             self.users_cur.cursor = i;
         }
-        self.detail = None;
+        self.load_detail(None);
         self.ensure_detail_loaded();
     }
 
@@ -600,7 +630,7 @@ impl App {
     fn clamp_and_reload_detail(&mut self) {
         let len = self.users().len();
         self.users_cur.clamp(len);
-        self.detail = None;
+        self.load_detail(None);
         self.ensure_detail_loaded();
     }
 

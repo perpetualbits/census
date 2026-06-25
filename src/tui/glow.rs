@@ -1,11 +1,13 @@
 //! A tight yellow Gaussian "comet" that travels around the outer border.
 //!
 //! Each frame we recolour the border cells near a moving hotspot, blending their
-//! existing foreground toward yellow with a Gaussian falloff. Only the `style`
-//! of each cell is touched, so glyphs (and the title text in the top border)
-//! are preserved — the glow simply slides over them.
+//! existing foreground toward yellow with a Gaussian falloff. We drive this through
+//! mullion's [`render_rim`]: it walks the perimeter and hands each cell its
+//! normalised position plus current style, and our closure decides the new colour —
+//! so the glyphs (and the title text in the top border) are preserved, the glow just
+//! slides over them.
 
-use mullion::{ease::gaussian, style::Color, Buffer, Rect};
+use mullion::{ease::gaussian, render_rim, style::Color, Buffer, Rect};
 
 /// Glow colour (warm yellow).
 const GLOW: (f32, f32, f32) = (255.0, 210.0, 40.0);
@@ -21,43 +23,25 @@ pub fn edge_glow(buf: &mut Buffer, area: Rect, t: f32) {
     if area.width < 4 || area.height < 4 {
         return;
     }
-    let perim = perimeter(area);
-    let n = perim.len();
-    if n == 0 {
+    let perim = area.border_len() as f32;
+    if perim <= 0.0 {
         return;
     }
 
-    // Hotspot position along the perimeter, in cell units [0, n).
-    let head = (t / LOOP_SECS).rem_euclid(1.0) * n as f32;
+    // Hotspot position as a fraction of the perimeter, advancing clockwise.
+    let head = (t / LOOP_SECS).rem_euclid(1.0);
 
-    for (i, &(x, y)) in perim.iter().enumerate() {
-        // Circular distance from this cell to the hotspot.
-        let mut d = (i as f32 - head).abs();
-        d = d.min(n as f32 - d);
-
-        let intensity = gaussian(d, SIGMA);
+    render_rim(buf, area, &[], |pos, cur| {
+        // Shortest wrap-around arc to the hotspot, then back to cell units so SIGMA
+        // keeps its "width in cells" meaning.
+        let mut d = (pos - head).abs();
+        d = d.min(1.0 - d);
+        let intensity = gaussian(d * perim, SIGMA);
         if intensity < CUTOFF {
-            continue;
+            return None;
         }
-
-        let cell = buf.get_mut(x, y);
-        cell.style.fg = blend(cell.style.fg, intensity);
-    }
-}
-
-/// Border cell coordinates, clockwise from the top-left, with no duplicates.
-fn perimeter(area: Rect) -> Vec<(u16, u16)> {
-    let x0 = area.x;
-    let y0 = area.y;
-    let x1 = area.x + area.width - 1;
-    let y1 = area.y + area.height - 1;
-
-    let mut p = Vec::with_capacity(2 * (area.width + area.height) as usize);
-    for x in x0..=x1 { p.push((x, y0)); }            // top, →
-    for y in (y0 + 1)..=y1 { p.push((x1, y)); }      // right, ↓
-    for x in (x0..x1).rev() { p.push((x, y1)); }     // bottom, ←
-    for y in ((y0 + 1)..y1).rev() { p.push((x0, y)); } // left, ↑
-    p
+        Some(cur.fg(blend(cur.fg, intensity)))
+    });
 }
 
 /// Blend an existing colour toward the glow yellow by `t` in [0, 1].

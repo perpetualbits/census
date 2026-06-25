@@ -1,11 +1,11 @@
 //! In-app manual: a scrollable help overlay opened with `?`.
 
-use mullion::{border::Borders, Buffer, KeyCode, KeyModifiers, Rect};
+use mullion::{Buffer, KeyCode, KeyModifiers, Rect};
 
 use crate::tui::draw::btxt;
 use crate::tui::theme::*;
 
-use super::{center, OverlayResult};
+use super::{modal_frame, OverlayResult};
 
 /// The manual text. Lines beginning with `#` are section headers; blank lines
 /// are spacers; everything else is body text.
@@ -93,14 +93,7 @@ impl HelpView {
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         let w = area.width.saturating_sub(6).clamp(40, 78);
         let h = area.height.saturating_sub(4).clamp(8, 40);
-        let rect = center(area, w, h);
-
-        for y in rect.y..rect.y + rect.height {
-            for x in rect.x..rect.x + rect.width {
-                buf.set_string(x, y, " ", s_normal());
-            }
-        }
-        mullion::border::draw_box(buf, rect, Borders::ALL, &box_style());
+        let rect = modal_frame(buf, area, w, h);
         btxt(buf, rect.x + 2, rect.y, "  census — manual  ", s_title());
         btxt(buf, rect.x + 2, rect.y + rect.height - 1,
              " jk/PgUp/PgDn:scroll  g/G:top/bottom  ?/Esc:close ", s_dim());

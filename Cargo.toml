@@ -20,6 +20,7 @@ pwhash    = "1"
 rpassword = "7"
 serde     = { version = "1", features = ["derive"] }
 toml      = "0.8"
+zune-jpeg = "0.4"
 
 [profile.release]
 strip = true

@@ -13,7 +13,13 @@ pub mod newgroup;
 pub mod newuser;
 pub mod passwd;
 
-use mullion::{Buffer, KeyCode, KeyModifiers, Rect};
+use mullion::{
+    draw_panel,
+    float::{FloatChild, FloatLayer, FloatRect},
+    Buffer, KeyCode, KeyModifiers, Panel, Rect,
+};
+
+use crate::tui::theme::{box_style, s_normal};
 
 pub use confirm::ConfirmDialog;
 pub use help::HelpView;
@@ -95,9 +101,29 @@ impl Overlay {
     }
 }
 
+/// Census-styled modal chrome: centre a `w`×`h` box, clear its interior and draw the
+/// rounded frame in one pass via [`draw_panel`]. Returns the outer rect — the caller
+/// draws its own title/footer over that border and content inside it.
+pub fn modal_frame(buf: &mut Buffer, area: Rect, w: u16, h: u16) -> Rect {
+    let rect = center(area, w, h);
+    draw_panel(buf, rect, &Panel::new(box_style()).fill(s_normal()));
+    rect
+}
+
 /// A rect of size `w`×`h` centred within `area` (clamped to fit).
+///
+/// Placement goes through mullion's float layer: the modal is declared as a
+/// single parent-local [`FloatRect`] and `solve` translates it to absolute
+/// coordinates and clips it to `area`.
 pub fn center(area: Rect, w: u16, h: u16) -> Rect {
+    const MODAL: u64 = 0;
     let w = w.min(area.width);
     let h = h.min(area.height);
-    Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h)
+    let place = FloatRect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
+    FloatLayer::new()
+        .with_child(FloatChild::new(MODAL, place))
+        .solve(area)
+        .first()
+        .map(|&(_, r)| r)
+        .unwrap_or(area)
 }

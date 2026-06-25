@@ -1,26 +1,35 @@
 //! Group screens: group picker and the two-pane membership editor.
 
 use mullion::{
-    border::Borders,
     label::Align,
+    render_shared,
     table::{ColumnDef, ColumnGrid, ColumnKind},
-    Buffer, Rect,
+    Buffer, Constraint, LineWeight, Node, Orientation, Rect, Size,
 };
 
 use crate::ldap::client::User;
 use crate::tui::app::App;
-use crate::tui::draw::{btxt, fill_row, hline, inset};
+use crate::tui::draw::{btxt, fill_row, hline};
 use crate::tui::focus::Pane;
 use crate::tui::theme::*;
 
+/// Stable tile ids for the group screens.
+const GROUP_LIST: u64 = 1;
+const ALL_USERS:  u64 = 1;
+const MEMBERS:    u64 = 2;
+
 pub fn render_select(app: &App, buf: &mut Buffer) {
     let area = buf.area;
-    mullion::border::draw_box(buf, area, Borders::ALL, &box_style());
+    if area.width < 12 || area.height < 5 { return; }
+
+    let mut tree = Node::Tile(GROUP_LIST);
+    let rects = render_shared(buf, &mut tree, area, &box_style(), &[]);
+
     btxt(buf, area.x + 2, area.y, "  census — select group  ", s_title());
     btxt(buf, area.x + 2, area.y + area.height - 1,
          " jk:scroll  Enter:manage  n:new  D:del  ?:help  Esc:cancel ", s_dim());
 
-    let inner = inset(area, 1);
+    let inner = rects[0].1;
     if inner.height < 3 { return; }
 
     ColumnGrid::write_text(buf, inner, inner.y, "group", Align::Start, s_head());
@@ -46,7 +55,22 @@ pub fn render_membership(app: &App, buf: &mut Buffer) {
     if area.width < 30 || area.height < 5 { return; }
 
     let gname = app.selected_group().map(|g| g.name.as_str()).unwrap_or("?");
-    mullion::border::draw_box(buf, area, Borders::ALL, &box_style());
+
+    // All-users pane beside the members pane, split down the middle. The engine
+    // draws the frame and the shared divider; the active pane is heavied.
+    let mut tree = Node::Split {
+        orientation: Orientation::Horizontal,
+        children: vec![
+            (Constraint::new(Size::Fill(1)), Node::Tile(ALL_USERS)),
+            (Constraint::new(Size::Fill(1)), Node::Tile(MEMBERS)),
+        ],
+    };
+    let focused = if app.active_pane == Pane::Left { ALL_USERS } else { MEMBERS };
+    let rects = render_shared(
+        buf, &mut tree, area, &box_style(),
+        &[(focused, LineWeight::Heavy)],
+    );
+
     btxt(buf, area.x + 2, area.y, &format!("  census — {gname}  "), s_title());
 
     let bottom = area.y + area.height - 1;
@@ -65,23 +89,14 @@ pub fn render_membership(app: &App, buf: &mut Buffer) {
         }
     }
 
-    let inner = inset(area, 1);
-    let mid   = inner.width / 2;
-    let div_x = inner.x + mid;
-
-    // Vertical divider
-    btxt(buf, div_x, area.y, "┬", s_border());
-    for y in inner.y..inner.y + inner.height {
-        btxt(buf, div_x, y, "│", s_border());
+    let members = app.member_list();
+    for (id, r) in rects {
+        match id {
+            ALL_USERS => render_user_pane(app, buf, r, app.active_pane == Pane::Left),
+            MEMBERS   => render_member_pane(app, buf, r, &members, app.active_pane == Pane::Right),
+            _ => {}
+        }
     }
-    btxt(buf, div_x, area.y + area.height - 1, "┴", s_border());
-
-    let left_area  = Rect::new(inner.x, inner.y, mid,               inner.height);
-    let right_area = Rect::new(div_x,   inner.y, inner.width - mid,  inner.height);
-    let members    = app.member_list();
-
-    render_user_pane(app, buf, left_area,  app.active_pane == Pane::Left);
-    render_member_pane(app, buf, right_area, &members, app.active_pane == Pane::Right);
 }
 
 fn render_user_pane(app: &App, buf: &mut Buffer, area: Rect, active: bool) {
@@ -111,10 +126,8 @@ fn render_user_pane(app: &App, buf: &mut Buffer, area: Rect, active: bool) {
     }
 }
 
-fn render_member_pane(app: &App, buf: &mut Buffer, area: Rect, members: &[&User], active: bool) {
-    if area.width < 10 { return; }
-    // skip divider character by starting one column right
-    let content = Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), area.height);
+fn render_member_pane(app: &App, buf: &mut Buffer, content: Rect, members: &[&User], active: bool) {
+    if content.width < 10 { return; }
     let hs      = if active { s_head() } else { s_subhead() };
     let label   = format!("members ({})", members.len());
     ColumnGrid::write_text(buf, content, content.y, &label, Align::Start, hs);

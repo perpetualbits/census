@@ -12,6 +12,7 @@ use mullion::{
 use crate::ldap::client::User;
 use crate::tui::app::App;
 use crate::tui::draw::{btxt, fill_row, hline};
+use crate::tui::photo;
 use crate::tui::theme::*;
 
 /// One rendered line in the (scrollable) detail body.
@@ -61,7 +62,23 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
     ColumnGrid::write_text(buf, area, area.y, "detail", Align::Start, head);
     hline(buf, Rect::new(area.x, area.y + 1, area.width, 1));
 
-    let body = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(2));
+    let full_body = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(2));
+
+    // Portrait band at the top of the body, when the user carries a jpegPhoto;
+    // the attribute list then scrolls in the space below it.
+    let prows = photo_rows(app, full_body.height);
+    let body = if prows > 0 {
+        if let Some(frame) = app.detail_photo() {
+            let (cols, _) = photo::portrait_cells(frame);
+            let cols = cols.min(full_body.width);
+            let px = full_body.x + (full_body.width - cols) / 2;
+            photo::render(buf, Rect::new(px, full_body.y, cols, prows), frame);
+        }
+        let used = prows + 1; // one blank row between the portrait and the text
+        Rect::new(full_body.x, full_body.y + used, full_body.width, full_body.height.saturating_sub(used))
+    } else {
+        full_body
+    };
     let vis  = body.height as usize;
     let off  = app.detail_scroll.min(rows.len().saturating_sub(1));
 
@@ -113,6 +130,20 @@ pub fn target_row(app: &App, idx: usize) -> Option<usize> {
 /// Total scrollable rows for the currently-selected user (for scroll clamping).
 pub fn row_count(app: &App) -> usize {
     build(app).0.len()
+}
+
+/// Rows the portrait band occupies in a detail body of `body_h` rows (`0` when there
+/// is no photo or the pane is too short). Shared by [`render`] and
+/// `app::update_offsets` so the rendered text area and the scroll bookkeeping agree.
+pub fn photo_rows(app: &App, body_h: u16) -> u16 {
+    if body_h < 8 {
+        return 0;
+    }
+    match app.detail_photo() {
+        // Cap to half the body so the attribute list always keeps room.
+        Some(frame) => photo::portrait_cells(frame).1.min(body_h / 2),
+        None => 0,
+    }
 }
 
 fn model(user: &User, group_names: &[String]) -> (Vec<Row>, Vec<EditTarget>) {

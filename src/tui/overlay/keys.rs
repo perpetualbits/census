@@ -5,19 +5,19 @@
 //! set via [`Action::SetKeys`]; the editor is otherwise self-contained (it never
 //! opens a nested overlay).
 
-use mullion::{border::Borders, Buffer, KeyCode, KeyModifiers, Rect};
+use mullion::{line_edit, render_field, Buffer, FieldRender, KeyCode, KeyModifiers, Rect};
 
 use crate::tui::draw::btxt;
 use crate::tui::theme::*;
 
-use super::{center, Action, OverlayResult};
+use super::{modal_frame, Action, OverlayResult};
 
 pub struct KeyEditor {
     dn: String,
     keys: Vec<String>,
     cursor: usize,
-    /// `Some` while pasting a new key line; holds the in-progress buffer.
-    adding: Option<Vec<char>>,
+    /// `Some` while pasting a new key line; holds the `(buffer, cursor)` being typed.
+    adding: Option<(String, usize)>,
 }
 
 impl KeyEditor {
@@ -29,20 +29,18 @@ impl KeyEditor {
         use KeyCode::*;
 
         // Paste mode: keystrokes build the new key line.
-        if let Some(buf) = &mut self.adding {
+        if let Some((text, cur)) = &mut self.adding {
             match key {
                 Esc => { self.adding = None; }
                 Enter => {
-                    let line: String = buf.iter().collect::<String>().trim().to_string();
+                    let line = text.trim().to_string();
                     if !line.is_empty() {
                         self.keys.push(line);
                         self.cursor = self.keys.len() - 1;
                     }
                     self.adding = None;
                 }
-                Char(c)   => buf.push(c),
-                Backspace => { buf.pop(); }
-                _ => {}
+                _ => { line_edit(text, cur, key); }
             }
             return OverlayResult::Stay;
         }
@@ -64,7 +62,7 @@ impl KeyEditor {
                 }
                 OverlayResult::Stay
             }
-            Char('a') => { self.adding = Some(Vec::new()); OverlayResult::Stay }
+            Char('a') => { self.adding = Some((String::new(), 0)); OverlayResult::Stay }
             Char('s') | Enter => OverlayResult::Commit(Action::SetKeys {
                 dn: self.dn.clone(),
                 keys: self.keys.clone(),
@@ -76,14 +74,7 @@ impl KeyEditor {
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         let w = area.width.saturating_sub(6).clamp(40, 100);
         let h = (self.keys.len() as u16 + 6).clamp(8, area.height.saturating_sub(2));
-        let rect = center(area, w, h);
-
-        for y in rect.y..rect.y + rect.height {
-            for x in rect.x..rect.x + rect.width {
-                buf.set_string(x, y, " ", s_normal());
-            }
-        }
-        mullion::border::draw_box(buf, rect, Borders::ALL, &box_style());
+        let rect = modal_frame(buf, area, w, h);
         btxt(buf, rect.x + 2, rect.y, "  ssh keys  ", s_title());
 
         let hint = if self.adding.is_some() {
@@ -112,13 +103,15 @@ impl KeyEditor {
             btxt(buf, inner_x, y, &shown, sty);
         }
 
-        // Inline paste field.
-        if let Some(b) = &self.adding {
+        // Inline paste field: "> " prompt, then the scrolling editable line.
+        if let Some((text, cur)) = &self.adding {
             let fy = rect.y + rect.height - 2;
-            for x in inner_x..inner_x + inner_w { buf.set_string(x, fy, " ", s_normal()); }
-            let text: String = b.iter().collect();
-            let shown = tail(&text, inner_w.saturating_sub(2) as usize);
-            btxt(buf, inner_x, fy, &format!("> {shown}"), s_normal());
+            btxt(buf, inner_x, fy, "> ", s_dim());
+            let fx = inner_x + 2;
+            let fw = inner_w.saturating_sub(2);
+            let opts = FieldRender { style: s_normal(), cursor_style: s_sel(), mask: None };
+            let mut scroll = 0;
+            render_field(buf, Rect::new(fx, fy, fw, 1), text, *cur, &mut scroll, &opts);
         }
     }
 }
@@ -136,10 +129,4 @@ fn summarize(key: &str) -> String {
 fn truncate(s: &str, w: usize) -> String {
     if s.chars().count() <= w { s.to_string() }
     else { s.chars().take(w.saturating_sub(1)).collect::<String>() + "…" }
-}
-
-/// Keep the last `w` chars (so the caret end of a long pasted line stays visible).
-fn tail(s: &str, w: usize) -> String {
-    let n = s.chars().count();
-    if n <= w { s.to_string() } else { s.chars().skip(n - w).collect() }
 }

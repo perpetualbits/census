@@ -37,13 +37,10 @@ impl ListCursor {
         if len > 0 && self.cursor >= len { self.cursor = len - 1; }
     }
 
-    /// Adjust `offset` so `cursor` stays within a window of `visible` rows.
-    pub fn keep_in_view(&mut self, visible: usize) {
-        if visible == 0 { self.offset = 0; return; }
-        if self.cursor < self.offset {
-            self.offset = self.cursor;
-        } else if self.cursor >= self.offset + visible {
-            self.offset = self.cursor + 1 - visible;
-        }
+    /// Adjust `offset` so `cursor` stays within a window of `visible` rows, never
+    /// leaving blank space past the end. Delegates the windowing arithmetic to
+    /// [`mullion::visible_window`].
+    pub fn keep_in_view(&mut self, len: usize, visible: usize) {
+        mullion::visible_window(self.cursor, &mut self.offset, len, visible);
     }
 }

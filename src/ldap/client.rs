@@ -26,6 +26,8 @@ pub struct User {
     pub home: String,
     pub shell: String,
     pub ssh_keys: Vec<String>,
+    /// Raw `jpegPhoto` bytes, when the entry carries one (binary attribute).
+    pub photo: Option<Vec<u8>>,
     pub attrs: HashMap<String, Vec<String>>,
 }
 
@@ -430,6 +432,8 @@ fn user_from_entry(e: SearchEntry, schema: &Schema) -> Option<User> {
         home: first(&e, schema.home).unwrap_or_default(),
         shell: first(&e, schema.shell).unwrap_or_default(),
         ssh_keys: e.attrs.get(schema.ssh_key).cloned().unwrap_or_default(),
+        // jpegPhoto is binary, so ldap3 surfaces it under `bin_attrs`, not `attrs`.
+        photo: e.bin_attrs.get(schema.photo).and_then(|v| v.first()).cloned(),
         attrs: e.attrs,
     })
 }

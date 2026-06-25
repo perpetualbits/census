@@ -3,13 +3,13 @@
 //! `Tab`/arrows move between fields, typing edits the focused field, `Enter`
 //! submits. On a validation error the form stays open with a red message.
 
-use mullion::{border::Borders, Buffer, KeyCode, KeyModifiers, Rect};
+use mullion::{line_edit, render_field, Buffer, FieldRender, KeyCode, KeyModifiers, Rect};
 
 use crate::ldap::client::NewUserSpec;
 use crate::tui::draw::btxt;
 use crate::tui::theme::*;
 
-use super::{center, Action, OverlayResult};
+use super::{modal_frame, Action, OverlayResult};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Key { Uid, Cn, Sn, Given, UidNumber, GidNumber, Home, Shell, Password }
@@ -17,15 +17,16 @@ enum Key { Uid, Cn, Sn, Given, UidNumber, GidNumber, Home, Shell, Password }
 struct Field {
     key: Key,
     label: &'static str,
-    value: Vec<char>,
+    value: String,
+    cursor: usize, // byte index into `value`
     masked: bool,
 }
 
 impl Field {
     fn new(key: Key, label: &'static str, value: &str, masked: bool) -> Self {
-        Self { key, label, value: value.chars().collect(), masked }
+        let value = value.to_string();
+        Self { key, label, cursor: value.len(), value, masked }
     }
-    fn text(&self) -> String { self.value.iter().collect() }
 }
 
 pub struct NewUserForm {
@@ -56,7 +57,7 @@ impl NewUserForm {
     }
 
     fn get(&self, key: Key) -> String {
-        self.fields.iter().find(|f| f.key == key).map(Field::text).unwrap_or_default()
+        self.fields.iter().find(|f| f.key == key).map(|f| f.value.clone()).unwrap_or_default()
     }
 
     fn build(&self) -> Result<NewUserSpec, String> {
@@ -106,23 +107,20 @@ impl NewUserForm {
                 Ok(spec) => OverlayResult::Commit(Action::CreateUser(spec)),
                 Err(e)   => { self.error = Some(e); OverlayResult::Stay }
             },
-            Char(c)   => { self.fields[self.cursor].value.push(c); OverlayResult::Stay }
-            Backspace => { self.fields[self.cursor].value.pop(); OverlayResult::Stay }
-            _ => OverlayResult::Stay,
+            // Up/Down/Tab move between fields (above); everything else edits the
+            // focused field, grapheme-aware with full cursor movement.
+            _ => {
+                let f = &mut self.fields[self.cursor];
+                line_edit(&mut f.value, &mut f.cursor, key);
+                OverlayResult::Stay
+            }
         }
     }
 
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         let w = area.width.saturating_sub(8).clamp(34, 60);
         let h = (self.fields.len() as u16 + 4).min(area.height.saturating_sub(2));
-        let rect = center(area, w, h);
-
-        for y in rect.y..rect.y + rect.height {
-            for x in rect.x..rect.x + rect.width {
-                buf.set_string(x, y, " ", s_normal());
-            }
-        }
-        mullion::border::draw_box(buf, rect, Borders::ALL, &box_style());
+        let rect = modal_frame(buf, area, w, h);
         btxt(buf, rect.x + 2, rect.y, "  new user  ", s_title());
         btxt(buf, rect.x + 2, rect.y + rect.height - 1,
              " Tab:field  Enter:create  Esc:cancel ", s_dim());
@@ -136,16 +134,13 @@ impl NewUserForm {
             btxt(buf, fx, y, &lab, if active { s_subhead() } else { s_dim() });
             let vx = fx + lab.len() as u16;
             let vw = fw.saturating_sub(lab.len() as u16);
-            if active {
-                for x in vx..vx + vw { buf.set_string(x, y, " ", s_normal()); }
-            }
-            let shown = if f.masked { "•".repeat(f.value.len()) } else { f.text() };
-            let shown: String = shown.chars().take(vw as usize).collect();
-            btxt(buf, vx, y, &shown, s_normal());
-            if active {
-                let cx = vx + shown.chars().count() as u16;
-                if cx < vx + vw { buf.set_string(cx, y, " ", s_sel()); }
-            }
+            let opts = FieldRender {
+                style: s_normal(),
+                cursor_style: if active { s_sel() } else { s_normal() },
+                mask: f.masked.then_some('•'),
+            };
+            let mut scroll = 0;
+            render_field(buf, Rect::new(vx, y, vw, 1), &f.value, f.cursor, &mut scroll, &opts);
         }
 
         if let Some(err) = &self.error {
