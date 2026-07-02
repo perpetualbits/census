@@ -48,6 +48,8 @@ pub struct Group {
     pub dup_name: bool,
     /// Another group in the directory shares this `gidNumber`.
     pub dup_gid: bool,
+    /// Full attribute record (populated by [`LdapClient::list_groups`]), for the detail pane.
+    pub attrs: HashMap<String, Vec<String>>,
 }
 
 /// Fields for creating a new user entry.
@@ -173,9 +175,10 @@ impl LdapClient {
     pub fn list_groups(&mut self) -> anyhow::Result<Vec<Group>> {
         let s = &self.schema;
         let base = s.group_base(&self.base_dn);
-        let attrs = vec![s.cn, s.gid_number, s.member];
+        // Fetch the full attribute set so the group detail pane can render it — groups
+        // are few, so this is as cheap as fetching a handful of named attributes.
         let (rs, _) = self.conn
-            .search(&base, Scope::OneLevel, s.group_filter, attrs)
+            .search(&base, Scope::OneLevel, s.group_filter, vec!["*"])
             .context("Group search failed")?
             .success()
             .context("Group search rejected")?;
@@ -197,14 +200,17 @@ impl LdapClient {
                 .filter(|c| !c.eq_ignore_ascii_case(&name))
                 .cloned()
                 .collect();
+            let gid_number = first(&e, s.gid_number).and_then(|v| v.parse::<u32>().ok());
+            let members = e.attrs.get(s.member).cloned().unwrap_or_default();
             groups.push(Group {
                 dn: e.dn.clone(),
                 name,
                 aliases,
-                gid_number: first(&e, s.gid_number).and_then(|v| v.parse::<u32>().ok()),
-                members: e.attrs.get(s.member).cloned().unwrap_or_default(),
+                gid_number,
+                members,
                 dup_name: false,
                 dup_gid: false,
+                attrs: e.attrs,
             });
         }
         flag_duplicates(&mut groups);
@@ -435,6 +441,20 @@ impl LdapClient {
         Ok(())
     }
 
+    /// Rename a group entry: change its `cn` RDN to `new_cn` via LDAP modrdn
+    /// (deleting the old RDN value), keeping it under the same parent. Returns the
+    /// new DN. `memberUid`-based membership and `gidNumber` references are unaffected.
+    pub fn rename_entry(&mut self, dn: &str, new_cn: &str) -> anyhow::Result<String> {
+        let new_rdn = format!("cn={new_cn}");
+        self.conn
+            .modifydn(dn, &new_rdn, true, None)
+            .context("Rename (modrdn) failed")?
+            .success()
+            .context("Rename (modrdn) rejected")?;
+        let tail = dn.split_once(',').map(|(_, rest)| rest).unwrap_or("");
+        Ok(if tail.is_empty() { new_rdn } else { format!("{new_rdn},{tail}") })
+    }
+
     /// Read every user attribute of an entry as raw bytes (`*`, no operational
     /// attributes), so it can be re-created verbatim later. Text and binary
     /// attributes are merged into one `name → values` list. Used to capture the
@@ -584,6 +604,7 @@ mod tests {
             members: vec![],
             dup_name: false,
             dup_gid: false,
+            attrs: HashMap::new(),
         }
     }
 
