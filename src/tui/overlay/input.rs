@@ -100,6 +100,7 @@ impl InputDialog {
             style: s_normal(),
             cursor_style: s_sel(),
             mask: self.masked.then_some('•'),
+            ctx: mullion::TextCtx::LTR,
         };
         let mut scroll = 0;
         render_field(buf, field, &self.value, self.cursor, &mut scroll, &opts);

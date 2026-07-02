@@ -109,7 +109,7 @@ impl KeyEditor {
             btxt(buf, inner_x, fy, "> ", s_dim());
             let fx = inner_x + 2;
             let fw = inner_w.saturating_sub(2);
-            let opts = FieldRender { style: s_normal(), cursor_style: s_sel(), mask: None };
+            let opts = FieldRender { style: s_normal(), cursor_style: s_sel(), mask: None, ctx: mullion::TextCtx::LTR };
             let mut scroll = 0;
             render_field(buf, Rect::new(fx, fy, fw, 1), text, *cur, &mut scroll, &opts);
         }

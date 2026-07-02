@@ -138,6 +138,7 @@ impl NewUserForm {
                 style: s_normal(),
                 cursor_style: if active { s_sel() } else { s_normal() },
                 mask: f.masked.then_some('•'),
+                ctx: mullion::TextCtx::LTR,
             };
             let mut scroll = 0;
             render_field(buf, Rect::new(vx, y, vw, 1), &f.value, f.cursor, &mut scroll, &opts);

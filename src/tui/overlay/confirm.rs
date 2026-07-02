@@ -78,6 +78,7 @@ impl ConfirmDialog {
                     style: if matches { s_ok() } else { s_err() },
                     cursor_style: s_sel(),
                     mask: None,
+                    ctx: mullion::TextCtx::LTR,
                 };
                 let fw = rect.width.saturating_sub(4);
                 let mut scroll = 0;

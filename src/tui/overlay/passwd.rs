@@ -94,6 +94,7 @@ fn field_line(buf: &mut Buffer, x: u16, y: u16, w: u16, label: &str, val: &str, 
         style: s_normal(),
         cursor_style: if active { s_sel() } else { s_normal() },
         mask: Some('•'),
+        ctx: mullion::TextCtx::LTR,
     };
     let mut scroll = 0;
     render_field(buf, Rect::new(fx, y, fw, 1), val, cursor, &mut scroll, &opts);
