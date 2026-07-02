@@ -11,7 +11,7 @@ use mullion::{
 
 use crate::ldap::client::User;
 use crate::tui::app::App;
-use crate::tui::draw::{btxt, fill_row, hline};
+use crate::tui::draw::{btxt, fill_row, hline, vscroll};
 use crate::tui::photo;
 use crate::tui::theme::*;
 
@@ -81,31 +81,26 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
     };
     let vis  = body.height as usize;
     let off  = app.detail_scroll.min(rows.len().saturating_sub(1));
+    let content = vscroll(buf, body, off, rows.len(), vis);
 
     let grid = kv_grid();
-    let cols = grid.resolve(body);
+    let cols = grid.resolve(content);
 
     for (i, row) in rows.iter().enumerate().skip(off).take(vis) {
-        let y   = body.y + (i - off) as u16;
+        let y   = content.y + (i - off) as u16;
         let sel = Some(i) == sel_row;
-        if sel { fill_row(buf, body.x, y, body.width, s_sel()); }
+        if sel { fill_row(buf, content.x, y, content.width, s_sel()); }
         match row {
-            Row::Title(t)   => btxt(buf, body.x, y, t, if sel { s_sel() } else { s_title() }),
-            Row::Section(t) => btxt(buf, body.x, y, t, head),
+            Row::Title(t)   => btxt(buf, content.x, y, t, if sel { s_sel() } else { s_title() }),
+            Row::Section(t) => btxt(buf, content.x, y, t, head),
             Row::Kv(k, v) => {
                 let (ks, vs) = if sel { (s_sel(), s_sel()) } else { (s_dim(), s_normal()) };
                 ColumnGrid::write_text(buf, cols[0], y, k, Align::Start, ks);
                 ColumnGrid::write_text(buf, cols[2], y, v, Align::Start, vs);
             }
-            Row::Text(t) => btxt(buf, body.x + 2, y, t, if sel { s_sel() } else { s_normal() }),
+            Row::Text(t) => btxt(buf, content.x + 2, y, t, if sel { s_sel() } else { s_normal() }),
             Row::Blank => {}
         }
-    }
-
-    if rows.len() > vis {
-        let more = format!("… {}/{} ", off + vis.min(rows.len() - off), rows.len());
-        let mx = area.x + area.width.saturating_sub(more.len() as u16);
-        btxt(buf, mx, area.y, &more, s_dim());
     }
 }
 

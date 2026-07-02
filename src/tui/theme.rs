@@ -17,6 +17,7 @@ pub const C_SEL_FG: Color = Color::Rgb(0,   0,   0  );
 pub const C_SEL_BG: Color = Color::Rgb(80,  120, 210);
 pub const C_MEMBER: Color = Color::Rgb(80,  190, 100);
 pub const C_OK:     Color = Color::Rgb(80,  200, 100);
+pub const C_WARN:   Color = Color::Rgb(230, 180, 60 );
 pub const C_ERR:    Color = Color::Rgb(220, 80,  80 );
 
 // ─── style helpers ───────────────────────────────────────────────────────────
@@ -30,6 +31,7 @@ pub fn s_subhead() -> Style { Style::default().fg(C_HDR2) }
 pub fn s_sel()     -> Style { Style::default().fg(C_SEL_FG).bg(C_SEL_BG) }
 pub fn s_member()  -> Style { Style::default().fg(C_MEMBER) }
 pub fn s_ok()      -> Style { Style::default().fg(C_OK) }
+pub fn s_warn()    -> Style { Style::default().fg(C_WARN) }
 pub fn s_err()     -> Style { Style::default().fg(C_ERR) }
 
 pub fn box_style() -> BorderStyle {
