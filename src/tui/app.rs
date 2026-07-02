@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseEventKind};
 use mullion::{backend::CrosstermBackend, Buffer, EventReader, KeyCode, KeyModifiers, Rect, Terminal};
 
 use crate::ldap::client::{Group, User};
@@ -10,6 +10,8 @@ use crate::session::Session;
 
 use super::focus::{ListCursor, Pane};
 use super::glow;
+use super::journal::{self, Journal};
+use super::ldif;
 use super::overlay::{self, Action, Overlay, OverlayResult};
 use super::screens;
 
@@ -48,6 +50,11 @@ pub struct App {
 
     anim_start: Instant,
     anim_on: bool,
+
+    /// Rollback journal (on-disk LDIF) + in-app undo stack.
+    journal: Journal,
+    /// Whether the bottom LDIF change-preview tile is shown.
+    show_preview: bool,
 }
 
 impl App {
@@ -69,6 +76,8 @@ impl App {
             status: None, write_mode, dry_run,
             anim_start: Instant::now(),
             anim_on: true,
+            journal: Journal::new(),
+            show_preview: false,
         }
     }
 
@@ -93,6 +102,18 @@ impl App {
     pub fn groups(&self) -> &[Group] { &self.session().groups }
 
     pub fn detail(&self) -> Option<&User> { self.detail.as_ref() }
+
+    /// Connection/password facts for the active session (drives the top-border gap).
+    pub fn conn_info(&self) -> &crate::conninfo::ConnInfo { &self.session().conn }
+
+    /// Recent change records (LDIF blocks) for the preview tile.
+    pub fn journal_log(&self) -> &[String] { &self.journal.log }
+
+    /// Path of the on-disk rollback journal (shown in the preview footer).
+    pub fn journal_path(&self) -> &std::path::Path { self.journal.path() }
+
+    /// Count of undoable steps on the stack (shown in the preview header).
+    pub fn undo_depth(&self) -> usize { self.journal.undo.len() }
 
     /// The decoded portrait for the cursored user, if it carries a `jpegPhoto`.
     pub fn detail_photo(&self) -> Option<&mullion::video::Frame> { self.detail_photo.as_ref() }
@@ -199,11 +220,46 @@ fn main_loop(
     }
 }
 
-/// Route one captured event to the key handler; returns `true` to quit.
+/// Route one captured event to the key/mouse handlers; returns `true` to quit.
 fn dispatch(app: &mut App, ev: Event) -> anyhow::Result<bool> {
     match ev {
-        Event::Key(key) => handle_key(app, key.code, key.modifiers),
+        Event::Key(key)  => handle_key(app, key.code, key.modifiers),
+        Event::Mouse(me) => { handle_mouse(app, me.kind); Ok(false) }
         _ => Ok(false),
+    }
+}
+
+/// Mouse handling: the wheel scrolls the active list/pane, mirroring `j`/`k`.
+/// (Click-to-select is a later nicety — it needs per-frame pane geometry.)
+fn handle_mouse(app: &mut App, kind: MouseEventKind) {
+    let down = match kind {
+        MouseEventKind::ScrollDown => true,
+        MouseEventKind::ScrollUp   => false,
+        _ => return,
+    };
+    // A modal overlay owns all input; ignore the wheel while one is open.
+    if app.overlay.is_some() { return; }
+    match app.mode {
+        Mode::Browse => match app.browse_focus {
+            Pane::Left => {
+                if down { app.users_cur.down(app.users().len()); } else { app.users_cur.up(); }
+                app.ensure_detail_loaded();
+            }
+            Pane::Right => {
+                app.detail_scroll = if down {
+                    app.detail_scroll.saturating_add(1)
+                } else {
+                    app.detail_scroll.saturating_sub(1)
+                };
+            }
+        },
+        Mode::GroupSelect => {
+            if down { app.groups_cur.down(app.groups().len()); } else { app.groups_cur.up(); }
+        }
+        Mode::Membership => match app.active_pane {
+            Pane::Left  => if down { app.left_cur.down(app.users().len()); } else { app.left_cur.up() },
+            Pane::Right => if down { app.right_cur.down(app.member_list().len()); } else { app.right_cur.up() },
+        },
     }
 }
 
@@ -279,6 +335,18 @@ fn handle_key(
     // `?` opens the manual from any screen.
     if key == Char('?') {
         app.overlay = Some(Overlay::Help(overlay::HelpView::new()));
+        return Ok(false);
+    }
+
+    // `u` undoes the last reversible write from any screen (write mode only).
+    if key == Char('u') && app.can_write_ui() {
+        undo(app)?;
+        return Ok(false);
+    }
+
+    // `L` toggles the LDIF change-preview tile.
+    if key == Char('L') {
+        app.show_preview = !app.show_preview;
         return Ok(false);
     }
 
@@ -492,15 +560,22 @@ fn describe_action(action: &Action) -> String {
             format!("ADD group cn={name} (gidNumber={gid_number})"),
         Action::DeleteGroup { dn, .. } =>
             format!("DELETE {dn}"),
+        Action::RestoreEntry { dn, .. } =>
+            format!("RESTORE {dn}"),
     }
 }
 
-/// Execute a committed [`Action`]. The single place writes happen: gated on
-/// `--write`, then dispatched to the active session's client, then the affected
-/// caches are refreshed.
+/// Commit a requested [`Action`]: the single place writes happen. Gated on
+/// `--write`, it captures the pre-state needed to reverse the change, applies it,
+/// then journals the forward LDIF and pushes the inverse onto the undo stack.
 fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
-    // Dry-run: report the LDAP operation that would be sent, change nothing.
+    // Dry-run: report the LDAP operation that would be sent, log the would-be LDIF
+    // to the preview feed, change nothing.
     if app.dry_run {
+        let base_dn = app.session().client.base_dn.clone();
+        let schema  = app.session().client.schema().clone();
+        let ldif    = ldif::action_ldif(&action, &base_dn, &schema);
+        app.journal.note(&format!("[dry-run] {}", describe_action(&action)), &ldif);
         app.status = Some((format!("[dry-run] {}", describe_action(&action)), false));
         return Ok(());
     }
@@ -508,101 +583,201 @@ fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
         app.status = Some(("Read-only — pass --write to modify".into(), true));
         return Ok(());
     }
-    match action {
+    // Capture the inverse *before* applying — reversing a delete/replace needs the
+    // old state, which is gone once the write lands.
+    let inverse = inverse_of(app, &action);
+    if apply(app, &action)? {
+        record_action(app, &action);
+        if let Some((label, inv)) = inverse {
+            app.journal.undo.push(journal::UndoStep { label, inverse: inv });
+        }
+    }
+    Ok(())
+}
+
+/// Undo the most recent reversible write by applying its stored inverse (which is
+/// itself journaled, but pushes no new undo step).
+fn undo(app: &mut App) -> anyhow::Result<()> {
+    if app.dry_run {
+        app.status = Some(("dry-run: nothing is actually written, so nothing to undo".into(), false));
+        return Ok(());
+    }
+    if !app.can_write_ui() {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return Ok(());
+    }
+    let Some(step) = app.journal.undo.pop() else {
+        app.status = Some(("Nothing to undo".into(), false));
+        return Ok(());
+    };
+    if apply(app, &step.inverse)? {
+        record_action(app, &step.inverse);
+        app.status = Some((format!("Undid: {}", step.label), false));
+    }
+    Ok(())
+}
+
+/// Execute one action against the active session's client, refresh the affected
+/// caches, and set the status line. Returns `true` on success. Does **not** touch
+/// the journal or undo stack — that is [`perform`]/[`undo`]'s job.
+fn apply(app: &mut App, action: &Action) -> anyhow::Result<bool> {
+    let ok = match action {
         Action::SetAttr { dn, attr, values } => {
             let refs: Vec<&str> = values.iter().map(String::as_str).collect();
-            match app.session_mut().client.modify_replace(&dn, &attr, &refs) {
+            match app.session_mut().client.modify_replace(dn, attr, &refs) {
                 Ok(()) => {
                     app.reload_detail_record();
-                    let msg = if refs.is_empty() {
-                        format!("Cleared {attr}")
-                    } else {
-                        format!("Set {attr}")
-                    };
+                    let msg = if refs.is_empty() { format!("Cleared {attr}") } else { format!("Set {attr}") };
                     app.status = Some((msg, false));
+                    true
                 }
-                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
             }
         }
         Action::SetKeys { dn, keys } => {
             let n = keys.len();
-            match app.session_mut().client.ssh_key_replace(&dn, &keys) {
-                Ok(()) => {
-                    app.reload_detail_record();
-                    app.status = Some((format!("Saved {n} ssh key(s)"), false));
-                }
-                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            match app.session_mut().client.ssh_key_replace(dn, keys) {
+                Ok(()) => { app.reload_detail_record(); app.status = Some((format!("Saved {n} ssh key(s)"), false)); true }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
             }
         }
         Action::AddMember { group_dn, uid, group } => {
-            let session = app.session_mut();
-            match session.client.group_add_member(&group_dn, &uid) {
-                Ok(()) => {
-                    session.refresh_groups()?;
-                    app.status = Some((format!("Added {uid} to {group}"), false));
-                }
-                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            match app.session_mut().client.group_add_member(group_dn, uid) {
+                Ok(()) => { app.session_mut().refresh_groups()?; app.status = Some((format!("Added {uid} to {group}"), false)); true }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
             }
         }
         Action::DelMember { group_dn, uid, group } => {
-            let session = app.session_mut();
-            match session.client.group_remove_member(&group_dn, &uid) {
-                Ok(()) => {
-                    session.refresh_groups()?;
-                    app.status = Some((format!("Removed {uid} from {group}"), false));
-                }
-                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            match app.session_mut().client.group_remove_member(group_dn, uid) {
+                Ok(()) => { app.session_mut().refresh_groups()?; app.status = Some((format!("Removed {uid} from {group}"), false)); true }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
             }
         }
         Action::SetPasswd { dn, plaintext } => {
-            match app.session_mut().client.set_password(&dn, &plaintext) {
-                Ok(())  => { app.status = Some(("Password updated".into(), false)); }
-                Err(e)  => { app.status = Some((format!("Error: {e}"), true)); }
+            match app.session_mut().client.set_password(dn, plaintext) {
+                Ok(())  => { app.status = Some(("Password updated".into(), false)); true }
+                Err(e)  => { app.status = Some((format!("Error: {e}"), true)); false }
             }
         }
         Action::CreateUser(spec) => {
             let uid = spec.uid.clone();
-            match app.session_mut().client.add_user(&spec) {
-                Ok(_dn) => {
-                    app.session_mut().refresh_users()?;
-                    app.select_user(&uid);
-                    app.status = Some((format!("Created user {uid}"), false));
-                }
-                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            match app.session_mut().client.add_user(spec) {
+                Ok(_dn) => { app.session_mut().refresh_users()?; app.select_user(&uid); app.status = Some((format!("Created user {uid}"), false)); true }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
             }
         }
         Action::DeleteEntry { dn, label } => {
-            match app.session_mut().client.delete_entry(&dn) {
-                Ok(()) => {
-                    app.session_mut().refresh_users()?;
-                    app.clamp_and_reload_detail();
-                    app.status = Some((format!("Deleted {label}"), false));
-                }
-                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            match app.session_mut().client.delete_entry(dn) {
+                Ok(()) => { app.session_mut().refresh_users()?; app.clamp_and_reload_detail(); app.status = Some((format!("Deleted {label}"), false)); true }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
             }
         }
         Action::CreateGroup { name, gid_number } => {
-            match app.session_mut().client.add_group(&name, gid_number, &[]) {
-                Ok(_dn) => {
-                    app.session_mut().refresh_groups()?;
-                    app.select_group(&name);
-                    app.status = Some((format!("Created group {name}"), false));
-                }
-                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            match app.session_mut().client.add_group(name, *gid_number, &[]) {
+                Ok(dn) => { app.session_mut().refresh_groups()?; app.select_group_by_dn(&dn); app.status = Some((format!("Created group {name}"), false)); true }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
             }
         }
         Action::DeleteGroup { dn, name } => {
-            match app.session_mut().client.delete_entry(&dn) {
-                Ok(()) => {
-                    app.session_mut().refresh_groups()?;
-                    app.groups_cur.clamp(app.groups().len());
-                    app.status = Some((format!("Deleted group {name}"), false));
-                }
-                Err(e) => { app.status = Some((format!("Error: {e}"), true)); }
+            match app.session_mut().client.delete_entry(dn) {
+                Ok(()) => { app.session_mut().refresh_groups()?; app.groups_cur.clamp(app.groups().len()); app.status = Some((format!("Deleted group {name}"), false)); true }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
             }
         }
+        Action::RestoreEntry { dn, attrs, label } => {
+            match app.session_mut().client.add_raw(dn, attrs) {
+                Ok(()) => {
+                    app.session_mut().refresh_users()?;
+                    app.session_mut().refresh_groups()?;
+                    app.status = Some((format!("Restored {label}"), false));
+                    true
+                }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
+            }
+        }
+    };
+    Ok(ok)
+}
+
+/// Append the forward LDIF change record for `action` to the on-disk journal.
+fn record_action(app: &mut App, action: &Action) {
+    let base_dn = app.session().client.base_dn.clone();
+    let schema  = app.session().client.schema().clone();
+    let ldif    = ldif::action_ldif(action, &base_dn, &schema);
+    let header  = format!("epoch {} | {} | {}", now_secs(), whoami(), describe_action(action));
+    if let Err(e) = app.journal.record(&header, &ldif) {
+        app.status = Some((format!("journal write failed: {e}"), true));
     }
-    Ok(())
+}
+
+/// Compute the inverse of `action` (and a human label), reading whatever pre-state
+/// the reversal needs. `None` when the action cannot be undone (e.g. a password set,
+/// whose previous value is unknowable).
+fn inverse_of(app: &mut App, action: &Action) -> Option<(String, Action)> {
+    match action {
+        Action::AddMember { group_dn, uid, group } => Some((
+            format!("add {uid} to {group}"),
+            Action::DelMember { group_dn: group_dn.clone(), uid: uid.clone(), group: group.clone() },
+        )),
+        Action::DelMember { group_dn, uid, group } => Some((
+            format!("remove {uid} from {group}"),
+            Action::AddMember { group_dn: group_dn.clone(), uid: uid.clone(), group: group.clone() },
+        )),
+        Action::SetAttr { dn, attr, .. } => {
+            let old = current_attr_values(app, dn, attr);
+            Some((format!("edit {attr}"), Action::SetAttr { dn: dn.clone(), attr: attr.clone(), values: old }))
+        }
+        Action::SetKeys { dn, .. } => {
+            let attr = app.session().client.schema().ssh_key;
+            let old = current_attr_values(app, dn, attr);
+            Some(("edit ssh keys".to_string(), Action::SetKeys { dn: dn.clone(), keys: old }))
+        }
+        Action::CreateUser(spec) => {
+            let dn = app.session().client.schema().user_dn(&spec.uid, &app.session().client.base_dn);
+            Some((format!("create user {}", spec.uid), Action::DeleteEntry { dn, label: spec.uid.clone() }))
+        }
+        Action::CreateGroup { name, .. } => {
+            let c = &app.session().client;
+            let dn = format!("{}={},{},{}", c.schema().cn, name, c.schema().group_ou, c.base_dn);
+            Some((format!("create group {name}"), Action::DeleteGroup { dn, name: name.clone() }))
+        }
+        Action::DeleteEntry { dn, label } => {
+            let attrs = app.session_mut().client.read_entry_raw(dn).ok()?;
+            Some((format!("delete {label}"), Action::RestoreEntry { dn: dn.clone(), attrs, label: label.clone() }))
+        }
+        Action::DeleteGroup { dn, name } => {
+            let attrs = app.session_mut().client.read_entry_raw(dn).ok()?;
+            Some((format!("delete group {name}"), Action::RestoreEntry { dn: dn.clone(), attrs, label: name.clone() }))
+        }
+        // Restoring is itself reversible (delete again), so undo of a restore works.
+        Action::RestoreEntry { dn, label, .. } =>
+            Some((format!("restore {label}"), Action::DeleteEntry { dn: dn.clone(), label: label.clone() })),
+        // A password set cannot be reversed: the old hash is not recoverable.
+        Action::SetPasswd { .. } => None,
+    }
+}
+
+/// Current values of `attr` on `dn` (empty when the attribute is absent), read
+/// fresh so the captured inverse is exact.
+fn current_attr_values(app: &mut App, dn: &str, attr: &str) -> Vec<String> {
+    match app.session_mut().client.read_entry_raw(dn) {
+        Ok(attrs) => attrs.into_iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(attr))
+            .map(|(_, vals)| vals.iter().map(|v| String::from_utf8_lossy(v).into_owned()).collect())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn whoami() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "?".into())
 }
 
 impl App {
@@ -634,9 +809,10 @@ impl App {
         self.ensure_detail_loaded();
     }
 
-    /// Move the group cursor to the group named `name` (if present).
-    fn select_group(&mut self, name: &str) {
-        if let Some(i) = self.groups().iter().position(|g| g.name == name) {
+    /// Move the group cursor to the group with DN `dn` (if present). Resolving by
+    /// DN — not name — is what makes duplicate-named groups individually addressable.
+    fn select_group_by_dn(&mut self, dn: &str) {
+        if let Some(i) = self.groups().iter().position(|g| g.dn == dn) {
             self.groups_cur.cursor = i;
         }
     }
@@ -645,16 +821,35 @@ impl App {
 // ─── render dispatch ─────────────────────────────────────────────────────────
 
 fn render(app: &App, buf: &mut Buffer) {
+    // With the LDIF preview open, carve a bottom strip for it; the main screen
+    // (and its glowing frame + connection gap) occupies the top.
+    let full = buf.area;
+    let (main, preview) = if app.show_preview && full.height > 10 {
+        let ph = (full.height / 3).clamp(5, 14);
+        let main = Rect::new(full.x, full.y, full.width, full.height - ph);
+        let prev = Rect::new(full.x, full.y + full.height - ph, full.width, ph);
+        (main, Some(prev))
+    } else {
+        (full, None)
+    };
+
     match app.mode {
-        Mode::Browse      => screens::users::render(app, buf, app.browse_focus),
-        Mode::GroupSelect => screens::groups::render_select(app, buf),
-        Mode::Membership  => screens::groups::render_membership(app, buf),
+        Mode::Browse      => screens::users::render(app, buf, main, app.browse_focus),
+        Mode::GroupSelect => screens::groups::render_select(app, buf, main),
+        Mode::Membership  => screens::groups::render_membership(app, buf, main),
     }
-    // Travelling glow on the outer frame, under any modal overlay.
+    if let Some(pa) = preview {
+        screens::preview::render(app, buf, pa);
+    }
+
+    // Connection/password "gap" in the top border of the main frame (content pass):
+    // drawn over the frame the screen just laid down, and excluded from the glow.
+    let gap = super::topgap::draw_top_gap(buf, main, &app.conn_info().summary());
+    // Travelling glow on the main frame, under any modal overlay — skipping the gap.
     if app.anim_on {
-        glow::edge_glow(buf, buf.area, app.anim_start.elapsed().as_secs_f32());
+        glow::edge_glow(buf, main, app.anim_start.elapsed().as_secs_f32(), gap.as_slice());
     }
     if let Some(ov) = &app.overlay {
-        ov.render(buf, buf.area);
+        ov.render(buf, full);
     }
 }

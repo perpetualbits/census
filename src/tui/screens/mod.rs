@@ -2,4 +2,5 @@
 
 pub mod detail;
 pub mod groups;
+pub mod preview;
 pub mod users;
