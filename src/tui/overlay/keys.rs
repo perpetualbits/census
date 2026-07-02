@@ -5,7 +5,10 @@
 //! set via [`Action::SetKeys`]; the editor is otherwise self-contained (it never
 //! opens a nested overlay).
 
-use mullion::{line_edit, render_field, Buffer, FieldRender, KeyCode, KeyModifiers, Rect};
+use mullion::{
+    diff_lines, line_edit, render_diff_unified, render_field, Buffer, FieldRender, KeyCode,
+    KeyModifiers, Rect, TextCtx,
+};
 
 use crate::tui::draw::btxt;
 use crate::tui::theme::*;
@@ -15,6 +18,8 @@ use super::{modal_frame, Action, OverlayResult};
 pub struct KeyEditor {
     dn: String,
     keys: Vec<String>,
+    /// The key set at open time, for the "changes" diff.
+    original: Vec<String>,
     cursor: usize,
     /// `Some` while pasting a new key line; holds the `(buffer, cursor)` being typed.
     adding: Option<(String, usize)>,
@@ -22,7 +27,7 @@ pub struct KeyEditor {
 
 impl KeyEditor {
     pub fn new(dn: impl Into<String>, keys: Vec<String>) -> Self {
-        Self { dn: dn.into(), keys, cursor: 0, adding: None }
+        Self { dn: dn.into(), original: keys.clone(), keys, cursor: 0, adding: None }
     }
 
     pub fn handle_key(&mut self, key: KeyCode, _mods: KeyModifiers) -> OverlayResult {
@@ -72,8 +77,18 @@ impl KeyEditor {
     }
 
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
+        // The pending change, as a diff of summarised key sets (added +, removed -).
+        let orig: Vec<String> = self.original.iter().map(|k| summarize(k)).collect();
+        let curr: Vec<String> = self.keys.iter().map(|k| summarize(k)).collect();
+        let orig_refs: Vec<&str> = orig.iter().map(String::as_str).collect();
+        let curr_refs: Vec<&str> = curr.iter().map(String::as_str).collect();
+        let ops = diff_lines(&orig_refs, &curr_refs);
+        let changed = self.keys != self.original;
+        // Rows the diff panel needs (a header + the ops, capped), 0 when unchanged.
+        let diff_rows = if changed { (ops.len().min(5) as u16) + 1 } else { 0 };
+
         let w = area.width.saturating_sub(6).clamp(40, 100);
-        let h = (self.keys.len() as u16 + 6).clamp(8, area.height.saturating_sub(2));
+        let h = (self.keys.len() as u16 + 6 + diff_rows).clamp(8, area.height.saturating_sub(2));
         let rect = modal_frame(buf, area, w, h);
         btxt(buf, rect.x + 2, rect.y, "  ssh keys  ", s_title());
 
@@ -87,7 +102,7 @@ impl KeyEditor {
         let inner_x = rect.x + 2;
         let inner_w = rect.width.saturating_sub(4);
         let list_y  = rect.y + 1;
-        let list_h  = rect.height.saturating_sub(if self.adding.is_some() { 4 } else { 2 });
+        let list_h  = rect.height.saturating_sub((if self.adding.is_some() { 4 } else { 2 }) + diff_rows);
 
         if self.keys.is_empty() {
             btxt(buf, inner_x, list_y, "(no keys)", s_dim());
@@ -112,6 +127,15 @@ impl KeyEditor {
             let opts = FieldRender { style: s_normal(), cursor_style: s_sel(), mask: None, ctx: mullion::TextCtx::LTR };
             let mut scroll = 0;
             render_field(buf, Rect::new(fx, fy, fw, 1), text, *cur, &mut scroll, &opts);
+        }
+
+        // "Changes" panel: a unified diff of the key set vs how it was opened.
+        if changed && diff_rows > 1 {
+            let dy = list_y + list_h;
+            btxt(buf, inner_x, dy, "changes:", s_dim());
+            let drect = Rect::new(inner_x, dy + 1, inner_w, diff_rows - 1);
+            let mut top = 0;
+            render_diff_unified(buf, drect, &ops, &mut top, &mullion_theme(), TextCtx::LTR);
         }
     }
 }
