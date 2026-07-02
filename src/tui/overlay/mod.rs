@@ -12,6 +12,7 @@ pub mod keys;
 pub mod newgroup;
 pub mod newuser;
 pub mod passwd;
+pub mod textarea;
 
 use mullion::{
     draw_panel,
@@ -28,6 +29,7 @@ pub use keys::KeyEditor;
 pub use newgroup::NewGroupForm;
 pub use newuser::NewUserForm;
 pub use passwd::PasswdDialog;
+pub use textarea::TextAreaDialog;
 
 use crate::ldap::client::NewUserSpec;
 
@@ -83,6 +85,7 @@ pub enum Overlay {
     Passwd(PasswdDialog),
     NewUser(NewUserForm),
     NewGroup(NewGroupForm),
+    TextArea(TextAreaDialog),
     Help(HelpView),
 }
 
@@ -95,6 +98,7 @@ impl Overlay {
             Overlay::Passwd(d)   => d.handle_key(key, mods),
             Overlay::NewUser(d)  => d.handle_key(key, mods),
             Overlay::NewGroup(d) => d.handle_key(key, mods),
+            Overlay::TextArea(d) => d.handle_key(key, mods),
             Overlay::Help(d)     => d.handle_key(key, mods),
         }
     }
@@ -107,6 +111,7 @@ impl Overlay {
             Overlay::Passwd(d)   => d.render(buf, area),
             Overlay::NewUser(d)  => d.render(buf, area),
             Overlay::NewGroup(d) => d.render(buf, area),
+            Overlay::TextArea(d) => d.render(buf, area),
             Overlay::Help(d)     => d.render(buf, area),
         }
     }
