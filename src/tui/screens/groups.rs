@@ -9,7 +9,7 @@ use mullion::{
 
 use crate::ldap::client::User;
 use crate::tui::app::App;
-use crate::tui::draw::{btxt, fill_row, hline};
+use crate::tui::draw::{btxt, fill_row, hline, vscroll};
 use crate::tui::focus::Pane;
 use crate::tui::theme::*;
 
@@ -18,14 +18,23 @@ const GROUP_LIST: u64 = 1;
 const ALL_USERS:  u64 = 1;
 const MEMBERS:    u64 = 2;
 
-pub fn render_select(app: &App, buf: &mut Buffer) {
-    let area = buf.area;
+pub fn render_select(app: &App, buf: &mut Buffer, area: Rect) {
     if area.width < 12 || area.height < 5 { return; }
 
     let mut tree = Node::Tile(GROUP_LIST);
     let rects = render_shared(buf, &mut tree, area, &box_style(), &[]);
 
     btxt(buf, area.x + 2, area.y, "  census — select group  ", s_title());
+
+    // Duplicate summary on the top border, right-aligned, when collisions exist.
+    let n_dup_gid  = app.groups().iter().filter(|g| g.dup_gid).count();
+    let n_dup_name = app.groups().iter().filter(|g| g.dup_name).count();
+    if n_dup_gid + n_dup_name > 0 {
+        let summary = format!(" ⚠ {n_dup_gid} dup-gid · {n_dup_name} dup-name ");
+        let sx = area.x + area.width.saturating_sub(1 + summary.chars().count() as u16);
+        btxt(buf, sx, area.y, &summary, s_warn());
+    }
+
     btxt(buf, area.x + 2, area.y + area.height - 1,
          " jk:scroll  Enter:manage  n:new  D:del  ?:help  Esc:cancel ", s_dim());
 
@@ -38,20 +47,37 @@ pub fn render_select(app: &App, buf: &mut Buffer) {
     let data = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(2));
     let vis  = data.height as usize;
     let cur  = &app.groups_cur;
+    let content = vscroll(buf, data, cur.offset, app.groups().len(), vis);
 
     for (i, g) in app.groups().iter().enumerate().skip(cur.offset).take(vis) {
-        let y   = data.y + (i - cur.offset) as u16;
+        let y   = content.y + (i - cur.offset) as u16;
         let sel = i == cur.cursor;
-        let sty = if sel { s_sel() } else { s_normal() };
-        if sel { fill_row(buf, inner.x, y, inner.width, sty); }
+        let dup = g.dup_name || g.dup_gid;
+        let sty = if sel { s_sel() } else if dup { s_warn() } else { s_normal() };
+        if sel { fill_row(buf, content.x, y, content.width, sty); }
 
-        let label = format!("{} ({} members)", g.name, g.members.len());
-        ColumnGrid::write_text(buf, data, y, &label, Align::Start, sty);
+        let gid = g.gid_number.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
+        let alias = if g.aliases.is_empty() {
+            String::new()
+        } else {
+            format!("  aka {}", g.aliases.join(","))
+        };
+        let label = format!("{}  gid {}{}  ({} members)", g.name, gid, alias, g.members.len());
+        ColumnGrid::write_text(buf, content, y, &label, Align::Start, sty);
+
+        // Right-aligned collision marker, so duplicates are unmistakable.
+        if dup {
+            let mut marks = Vec::new();
+            if g.dup_name { marks.push("dup-name"); }
+            if g.dup_gid  { marks.push("dup-gid"); }
+            let mark = format!("⚠ {} ", marks.join(" "));
+            let mx = content.x + content.width.saturating_sub(mark.chars().count() as u16);
+            btxt(buf, mx, y, &mark, if sel { s_sel() } else { s_warn() });
+        }
     }
 }
 
-pub fn render_membership(app: &App, buf: &mut Buffer) {
-    let area = buf.area;
+pub fn render_membership(app: &App, buf: &mut Buffer, area: Rect) {
     if area.width < 30 || area.height < 5 { return; }
 
     let gname = app.selected_group().map(|g| g.name.as_str()).unwrap_or("?");
@@ -106,13 +132,14 @@ fn render_user_pane(app: &App, buf: &mut Buffer, area: Rect, active: bool) {
     ColumnGrid::write_text(buf, area, area.y, &label, Align::Start, hs);
     hline(buf, Rect::new(area.x, area.y + 1, area.width, 1));
 
-    let cols = pair_grid().resolve(area);
     let data = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(2));
     let vis  = data.height as usize;
     let cur  = &app.left_cur;
+    let content = vscroll(buf, data, cur.offset, app.users().len(), vis);
+    let cols = pair_grid().resolve(content);
 
     for (i, user) in app.users().iter().enumerate().skip(cur.offset).take(vis) {
-        let y         = data.y + (i - cur.offset) as u16;
+        let y         = content.y + (i - cur.offset) as u16;
         let sel       = active && i == cur.cursor;
         let is_member = app.member_uids().iter().any(|uid| uid == &user.uid);
         let sty = if sel { s_sel() }
@@ -120,7 +147,7 @@ fn render_user_pane(app: &App, buf: &mut Buffer, area: Rect, active: bool) {
                   else if active { s_normal() }
                   else { s_dim() };
 
-        if sel { fill_row(buf, area.x, y, area.width, sty); }
+        if sel { fill_row(buf, content.x, y, content.width, sty); }
         ColumnGrid::write_text(buf, cols[0], y, &user.uid, Align::Start, sty);
         ColumnGrid::write_text(buf, cols[2], y, &user.cn,  Align::Start, sty);
     }
@@ -133,16 +160,17 @@ fn render_member_pane(app: &App, buf: &mut Buffer, content: Rect, members: &[&Us
     ColumnGrid::write_text(buf, content, content.y, &label, Align::Start, hs);
     hline(buf, Rect::new(content.x, content.y + 1, content.width, 1));
 
-    let cols = pair_grid().resolve(content);
     let data = Rect::new(content.x, content.y + 2, content.width, content.height.saturating_sub(2));
     let vis  = data.height as usize;
     let cur  = &app.right_cur;
+    let rows = vscroll(buf, data, cur.offset, members.len(), vis);
+    let cols = pair_grid().resolve(rows);
 
     for (i, user) in members.iter().enumerate().skip(cur.offset).take(vis) {
-        let y   = data.y + (i - cur.offset) as u16;
+        let y   = rows.y + (i - cur.offset) as u16;
         let sel = active && i == cur.cursor;
         let sty = if sel { s_sel() } else if active { s_normal() } else { s_dim() };
-        if sel { fill_row(buf, content.x, y, content.width, sty); }
+        if sel { fill_row(buf, rows.x, y, rows.width, sty); }
         ColumnGrid::write_text(buf, cols[0], y, &user.uid, Align::Start, sty);
         ColumnGrid::write_text(buf, cols[2], y, &user.cn,  Align::Start, sty);
     }

@@ -8,7 +8,7 @@ use mullion::{
 };
 
 use crate::tui::app::App;
-use crate::tui::draw::{btxt, fill_row, hline};
+use crate::tui::draw::{btxt, fill_row, hline, vscroll};
 use crate::tui::focus::Pane;
 use crate::tui::theme::*;
 
@@ -18,8 +18,7 @@ use super::detail;
 const LIST: u64 = 1;
 const DETAIL: u64 = 2;
 
-pub fn render(app: &App, buf: &mut Buffer, focus: Pane) {
-    let area = buf.area;
+pub fn render(app: &App, buf: &mut Buffer, area: Rect, focus: Pane) {
     if area.width < 20 || area.height < 5 { return; }
 
     // List pane (left) beside the detail pane (right). The engine draws the
@@ -74,16 +73,17 @@ fn render_list(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
     ColumnGrid::write_text(buf, area, area.y, &label, Align::Start, hs);
     hline(buf, Rect::new(area.x, area.y + 1, area.width, 1));
 
-    let cols = list_grid().resolve(area);
     let data = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(2));
     let vis  = data.height as usize;
     let cur  = &app.users_cur;
+    let content = vscroll(buf, data, cur.offset, app.users().len(), vis);
+    let cols = list_grid().resolve(content);
 
     for (i, user) in app.users().iter().enumerate().skip(cur.offset).take(vis) {
-        let y   = data.y + (i - cur.offset) as u16;
+        let y   = content.y + (i - cur.offset) as u16;
         let sel = i == cur.cursor;
         let sty = if sel { s_sel() } else if focused { s_normal() } else { s_dim() };
-        if sel { fill_row(buf, area.x, y, area.width, sty); }
+        if sel { fill_row(buf, content.x, y, content.width, sty); }
         ColumnGrid::write_text(buf, cols[0], y, &user.uid, Align::Start, sty);
         ColumnGrid::write_text(buf, cols[2], y, &user.cn,  Align::Start, sty);
     }
