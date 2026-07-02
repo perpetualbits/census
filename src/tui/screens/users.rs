@@ -50,7 +50,7 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focus: Pane) {
                 &[("Tab", "pane"), ("jk", "attr"), ("e", "edit"), ("E", "big-edit"), ("K", "keys"),
                   ("p", "passwd"), ("u", "undo"), ("L", "ldif"), ("?", "help"), ("q", "quit")]
             } else {
-                &[("Tab", "pane"), ("jk", "users"), ("n", "new"), ("D", "del"),
+                &[("Tab", "pane"), ("jk", "users"), ("/", "search"), ("n", "new"), ("D", "del"),
                   ("g", "groups"), ("t", "tree"), ("u", "undo"), ("?", "help"), ("q", "quit")]
             };
             let count = format!(" {} users ", app.users().len());

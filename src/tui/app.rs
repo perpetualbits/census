@@ -22,7 +22,22 @@ const RENDER_TICK: Duration = Duration::from_millis(50);
 // ─── state ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode { Browse, GroupSelect, Membership, Dit }
+enum Mode { Browse, GroupSelect, Membership, Dit, Search }
+
+/// What a [`SearchHit`] points at, so `Enter` can jump to the right screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitKind { User, Group }
+
+/// One row in the cross-directory search results: a user or a group that matched
+/// the query, with the display text and the key (`uid` / group `dn`) used to jump.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub kind: HitKind,
+    pub key: String,        // uid (user) or dn (group)
+    pub primary: String,    // main label: uid or group name
+    pub secondary: String,  // dim context: cn · uid/gid, or gid · aliases
+    pub rank: u8,           // 0 exact, 1 prefix, 2 substring (lower sorts first)
+}
 
 /// One flattened row of the DIT tree browser (built from the children cache +
 /// expand-set each frame).
@@ -66,6 +81,13 @@ pub struct App {
     dit_rows: Vec<DitRow>,                        // flattened visible rows (rebuilt on change)
     dit_detail: Vec<(String, Vec<String>)>,      // selected entry's attributes
 
+    // Cross-directory search (opened with `/` from any screen).
+    pub search_cur: ListCursor,          // selection within the results list
+    search_query: String,                // the live query text
+    search_caret: usize,                 // caret (byte offset) within the query field
+    search_hits: Vec<SearchHit>,         // matches, recomputed on every query edit
+    search_from: Mode,                   // screen to return to on Esc
+
     selected_group: usize,
     pub active_pane: Pane,
     pub left_cur:  ListCursor,
@@ -106,6 +128,11 @@ impl App {
             dit_expanded: HashSet::new(),
             dit_rows: Vec::new(),
             dit_detail: Vec::new(),
+            search_cur: ListCursor::new(),
+            search_query: String::new(),
+            search_caret: 0,
+            search_hits: Vec::new(),
+            search_from: Mode::Browse,
             selected_group: 0,
             active_pane: Pane::Left,
             left_cur: ListCursor::new(),
@@ -446,6 +473,9 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind) {
             if down { app.dit_cur.down(app.dit_rows.len()); } else { app.dit_cur.up(); }
             app.load_dit_detail();
         }
+        Mode::Search => {
+            if down { app.search_cur.down(app.search_hits.len()); } else { app.search_cur.up(); }
+        }
     }
 }
 
@@ -467,6 +497,12 @@ fn update_offsets(app: &mut App, area: Rect) {
     let ndit = app.dit_rows.len();
     app.dit_cur.clamp(ndit);
     app.dit_cur.keep_in_view(ndit, vis);
+
+    // Search results list uses the whole inner area minus the query line + separator.
+    let nsearch = app.search_hits.len();
+    let search_vis = vis.saturating_sub(2).max(1);
+    app.search_cur.clamp(nsearch);
+    app.search_cur.keep_in_view(nsearch, search_vis);
 
     // Detail body height = inner(area-2) - header(1) - sep(1) = vis - 2, minus the
     // portrait band (photo rows + a gap) when the cursored user has a jpegPhoto.
@@ -554,6 +590,13 @@ fn handle_key(
     // `L` toggles the LDIF change-preview tile.
     if key == Char('L') {
         app.show_preview = !app.show_preview;
+        return Ok(false);
+    }
+
+    // `/` opens cross-directory search from any screen (read-only; no write gate).
+    // Suppressed while already searching, so `/` is a literal query character there.
+    if key == Char('/') && app.mode != Mode::Search {
+        app.open_search();
         return Ok(false);
     }
 
@@ -680,6 +723,39 @@ fn handle_key(
             (Pane::Right, Char('e')) => open_dit_attr_edit(app, false),
             (Pane::Right, Char('E')) => open_dit_attr_edit(app, true),
             _ => {}
+        },
+
+        Mode::Search => match key {
+            Esc => app.mode = app.search_from,
+            Up       => app.search_cur.up(),
+            Down     => app.search_cur.down(app.search_hits.len()),
+            PageUp   => app.search_cur.page(-10, app.search_hits.len()),
+            PageDown => app.search_cur.page(10, app.search_hits.len()),
+            Enter => {
+                if let Some(hit) = app.search_hits.get(app.search_cur.cursor).cloned() {
+                    match hit.kind {
+                        HitKind::User => {
+                            app.mode = Mode::Browse;
+                            app.browse_focus = Pane::Left;
+                            app.select_user(&hit.key);
+                        }
+                        HitKind::Group => {
+                            app.mode = Mode::GroupSelect;
+                            app.group_browse_focus = Pane::Left;
+                            app.select_group_by_dn(&hit.key);
+                            app.reset_group_detail();
+                        }
+                    }
+                } else {
+                    app.mode = app.search_from;
+                }
+            }
+            // Everything else edits the query field (chars, Backspace, Left/Right, …).
+            _ => {
+                if mullion::line_edit(&mut app.search_query, &mut app.search_caret, key) {
+                    app.recompute_search();
+                }
+            }
         },
     }
     Ok(false)
@@ -1233,6 +1309,29 @@ impl App {
         self.group_detail_cur = 0;
         self.group_detail_scroll = 0;
     }
+
+    // ── cross-directory search ────────────────────────────────────────────────
+
+    /// Enter search mode: remember where we came from, clear the query, focus the
+    /// (empty) results. Read-only — usable even without `--write`.
+    fn open_search(&mut self) {
+        self.search_from = self.mode;
+        self.mode = Mode::Search;
+        self.search_query.clear();
+        self.search_caret = 0;
+        self.recompute_search();
+    }
+
+    /// Rebuild the results from the current query and reset the selection to the top.
+    fn recompute_search(&mut self) {
+        let hits = search_hits(self.users(), self.groups(), &self.search_query);
+        self.search_hits = hits;
+        self.search_cur.reset();
+    }
+
+    pub fn search_query(&self) -> &str { &self.search_query }
+    pub fn search_caret(&self) -> usize { self.search_caret }
+    pub fn search_hits(&self) -> &[SearchHit] { &self.search_hits }
 }
 
 // ─── render dispatch ─────────────────────────────────────────────────────────
@@ -1255,6 +1354,7 @@ fn render(app: &App, buf: &mut Buffer) {
         Mode::GroupSelect => screens::groups::render_select(app, buf, main),
         Mode::Membership  => screens::groups::render_membership(app, buf, main),
         Mode::Dit         => screens::dit::render(app, buf, main),
+        Mode::Search      => screens::search::render(app, buf, main),
     }
     if let Some(pa) = preview {
         screens::preview::render(app, buf, pa);
@@ -1269,5 +1369,152 @@ fn render(app: &App, buf: &mut Buffer) {
     }
     if let Some(ov) = &app.overlay {
         ov.render(buf, full);
+    }
+}
+
+// ─── search matching ───────────────────────────────────────────────────────────
+
+/// Cap on results, so a 1-character query can't build a giant list.
+pub(crate) const MAX_HITS: usize = 300;
+
+/// Case-insensitive field score: `0` exact, `1` prefix, `2` substring, `None` when
+/// it doesn't occur. `needle` must already be lowercased and non-empty.
+fn score(hay: &str, needle: &str) -> Option<u8> {
+    let h = hay.to_lowercase();
+    if h == needle { Some(0) }
+    else if h.starts_with(needle) { Some(1) }
+    else if h.contains(needle) { Some(2) }
+    else { None }
+}
+
+/// Best (lowest) score of `needle` across `fields`; `None` if it matches none.
+fn best(needle: &str, fields: &[&str]) -> Option<u8> {
+    fields.iter().filter_map(|f| score(f, needle)).min()
+}
+
+/// Match `query` against users and groups by first/last name, account name (uid),
+/// group name, uidNumber and gidNumber, returning display-ready hits sorted by rank
+/// (exact < prefix < substring) then label, capped at [`MAX_HITS`].
+fn search_hits(users: &[User], groups: &[Group], query: &str) -> Vec<SearchHit> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() { return Vec::new(); }
+
+    let mut hits: Vec<SearchHit> = Vec::new();
+
+    for u in users {
+        let uidn = u.uid_number.to_string();
+        let gidn = u.gid_number.to_string();
+        let fields = [
+            u.uid.as_str(), u.cn.as_str(), u.given_name.as_str(),
+            u.sn.as_str(), uidn.as_str(), gidn.as_str(),
+        ];
+        if let Some(rank) = best(&q, &fields) {
+            hits.push(SearchHit {
+                kind: HitKind::User,
+                key: u.uid.clone(),
+                primary: u.uid.clone(),
+                secondary: format!("{}  ·  uid {}  gid {}", u.cn, u.uid_number, u.gid_number),
+                rank,
+            });
+        }
+    }
+
+    for g in groups {
+        let gidn = g.gid_number.map(|n| n.to_string());
+        let mut fields: Vec<&str> = vec![g.name.as_str()];
+        fields.extend(g.aliases.iter().map(String::as_str));
+        if let Some(s) = gidn.as_deref() { fields.push(s); }
+        if let Some(rank) = best(&q, &fields) {
+            let gid = gidn.as_deref().unwrap_or("—");
+            let aka = if g.aliases.is_empty() { String::new() }
+                      else { format!("  aka {}", g.aliases.join(",")) };
+            hits.push(SearchHit {
+                kind: HitKind::Group,
+                key: g.dn.clone(),
+                primary: g.name.clone(),
+                secondary: format!("gid {}  ·  {} members{}", gid, g.members.len(), aka),
+                rank,
+            });
+        }
+    }
+
+    hits.sort_by(|a, b| {
+        a.rank.cmp(&b.rank)
+            .then_with(|| a.primary.to_lowercase().cmp(&b.primary.to_lowercase()))
+    });
+    hits.truncate(MAX_HITS);
+    hits
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn user(uid: &str, cn: &str, given: &str, sn: &str, uidn: u32, gidn: u32) -> User {
+        User {
+            dn: format!("uid={uid},ou=users,dc=example"),
+            uid: uid.into(), cn: cn.into(),
+            sn: sn.into(), given_name: given.into(),
+            uid_number: uidn, gid_number: gidn,
+            home: String::new(), shell: String::new(),
+            ssh_keys: Vec::new(), photo: None, attrs: HashMap::new(),
+        }
+    }
+    fn group(name: &str, gid: Option<u32>, aliases: &[&str]) -> Group {
+        Group {
+            dn: format!("cn={name},ou=groups,dc=example"),
+            name: name.into(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            gid_number: gid, members: Vec::new(),
+            dup_name: false, dup_gid: false, attrs: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn empty_query_yields_nothing() {
+        let us = [user("quixote", "Alonso Quijano", "Alonso", "Quijano", 1001, 100)];
+        assert!(search_hits(&us, &[], "").is_empty());
+    }
+
+    #[test]
+    fn matches_first_name_and_returns_user() {
+        let us = [user("quixote", "Alonso Quijano", "Alonso", "Quijano", 1001, 100)];
+        let hits = search_hits(&us, &[], "alon");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, HitKind::User);
+        assert_eq!(hits[0].key, "quixote");
+    }
+
+    #[test]
+    fn matches_last_name_and_uidnumber() {
+        let us = [user("quixote", "Alonso Quijano", "Alonso", "Quijano", 1001, 100)];
+        assert_eq!(search_hits(&us, &[], "quijano").len(), 1);
+        assert_eq!(search_hits(&us, &[], "1001").len(), 1);
+    }
+
+    #[test]
+    fn matches_group_by_name_and_gidnumber() {
+        let gs = [group("knights-errant", Some(5000), &["windmillfighters"])];
+        let by_name = search_hits(&[], &gs, "knight");
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].kind, HitKind::Group);
+        assert_eq!(by_name[0].key, "cn=knights-errant,ou=groups,dc=example");
+        assert_eq!(search_hits(&[], &gs, "5000").len(), 1);   // gidNumber
+        assert_eq!(search_hits(&[], &gs, "windmill").len(), 1); // alias
+    }
+
+    #[test]
+    fn ranks_exact_and_prefix_before_substring() {
+        let us = [
+            user("bob",   "Bob Carob",  "Bob",   "Carob", 10, 100), // "rob" only mid-word (substring)
+            user("robby", "Robby Zzz",  "Robby", "Zzz",   11, 100), // "rob" prefix of uid
+            user("rob",   "Rob Aaa",    "Rob",   "Aaa",   12, 100), // "rob" exact uid
+        ];
+        let hits = search_hits(&us, &[], "rob");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].key, "rob");   // exact first
+        assert_eq!(hits[1].key, "robby"); // then prefix
+        assert_eq!(hits[2].key, "bob");   // then substring
     }
 }

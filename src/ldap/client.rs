@@ -23,6 +23,10 @@ pub struct User {
     pub dn: String,
     pub uid: String,
     pub cn: String,
+    /// `sn` (surname / last name); empty when absent. Also present in `attrs`.
+    pub sn: String,
+    /// `givenName` (first name); empty when absent. Also present in `attrs`.
+    pub given_name: String,
     pub uid_number: u32,
     pub gid_number: u32,
     pub home: String,
@@ -602,6 +606,8 @@ fn user_from_entry(e: SearchEntry, schema: &Schema) -> Option<User> {
         dn: e.dn.clone(),
         uid,
         cn: first(&e, schema.cn).unwrap_or_default(),
+        sn: first(&e, schema.sn).unwrap_or_default(),
+        given_name: first(&e, schema.given_name).unwrap_or_default(),
         uid_number: first(&e, schema.uid_number).and_then(|s| s.parse().ok()).unwrap_or(0),
         gid_number: first(&e, schema.gid_number).and_then(|s| s.parse().ok()).unwrap_or(0),
         home: first(&e, schema.home).unwrap_or_default(),

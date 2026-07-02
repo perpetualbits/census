@@ -57,7 +57,7 @@ pub fn render_select(app: &App, buf: &mut Buffer, area: Rect) {
                 &[("Tab", "list"), ("jk", "attr"), ("e", "edit"), ("E", "big-edit"), ("r", "rename"),
                   ("a", "del-alias"), ("u", "undo"), ("?", "help"), ("Esc", "")]
             } else {
-                &[("Tab", "detail"), ("jk", ""), ("Enter", "members"), ("n", "new"),
+                &[("Tab", "detail"), ("jk", ""), ("/", "search"), ("Enter", "members"), ("n", "new"),
                   ("D", "del"), ("a", "alias"), ("u", "undo"), ("L", "ldif"), ("?", "help"), ("Esc", "")]
             };
             keyhints(buf, area.x + 2, bottom, area.width.saturating_sub(4), pairs);
