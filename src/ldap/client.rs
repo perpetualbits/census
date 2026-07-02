@@ -3,6 +3,7 @@ use ldap3::{LdapConn, LdapConnSettings, Mod, Scope, SearchEntry};
 use std::collections::{HashMap, HashSet};
 
 use crate::config::{Config, PwScheme, TunnelConfig};
+use crate::conninfo::ConnVia;
 use crate::schema::Schema;
 use super::password::crypt_sha512;
 use super::tunnel::{self, Tunnel};
@@ -13,6 +14,7 @@ pub struct LdapClient {
     schema: Schema,
     password_scheme: PwScheme,
     _tunnel: Option<Tunnel>,
+    conn_via: ConnVia,
 }
 
 #[derive(Debug, Clone)]
@@ -32,12 +34,20 @@ pub struct User {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // gid_number kept for completeness; not shown in the TUI yet
 pub struct Group {
     pub dn: String,
+    /// Authoritative name: the RDN value from the DN (e.g. `cn=lofar` → `lofar`).
+    /// This is stable even when the entry carries a multi-valued `cn`.
     pub name: String,
-    pub gid_number: u32,
+    /// Other `cn` values on the entry (aliases), i.e. every `cn` that isn't `name`.
+    pub aliases: Vec<String>,
+    /// Parsed `gidNumber`, or `None` when the entry carries none (or an unparseable one).
+    pub gid_number: Option<u32>,
     pub members: Vec<String>,
+    /// Some `cn` of this group (name or alias) also appears on another group.
+    pub dup_name: bool,
+    /// Another group in the directory shares this `gidNumber`.
+    pub dup_gid: bool,
 }
 
 /// Fields for creating a new user entry.
@@ -56,7 +66,7 @@ pub struct NewUserSpec {
 
 impl LdapClient {
     pub fn connect(cfg: &Config, password: Option<&str>) -> anyhow::Result<Self> {
-        let (host, port, tun) = resolve_endpoint(cfg)?;
+        let (host, port, tun, conn_via) = resolve_endpoint(cfg)?;
 
         let url = if cfg.server.use_ssl {
             format!("ldaps://{host}:{port}")
@@ -93,8 +103,12 @@ impl LdapClient {
             schema: Schema::rfc2307(),
             password_scheme: cfg.server.password_scheme,
             _tunnel: tun,
+            conn_via,
         })
     }
+
+    /// How this client reached the directory (direct vs SSH tunnel), for the UI.
+    pub fn conn_via(&self) -> &ConnVia { &self.conn_via }
 
     /// The directory schema this client is bound to.
     #[allow(dead_code)] // consumed by the detail/edit views (P2/P4)
@@ -170,15 +184,30 @@ impl LdapClient {
         let mut groups = Vec::new();
         for entry in rs {
             let e = SearchEntry::construct(entry);
-            let name = first(&e, s.cn).unwrap_or_default();
-            if name.is_empty() { continue; }
+            let all_cns = e.attrs.get(s.cn).cloned().unwrap_or_default();
+            // The authoritative name is the RDN value, not `cn[0]`: an entry can
+            // carry a multi-valued `cn` in any order (e.g. DN `cn=lofar` with
+            // `cn: cobalt` first), and the RDN is what actually identifies it.
+            // Never silently drop an entry: a nameless group still exists.
+            let name = rdn_value(&e.dn)
+                .filter(|v| !v.is_empty())
+                .or_else(|| all_cns.first().cloned())
+                .unwrap_or_else(|| "(no cn)".to_string());
+            let aliases: Vec<String> = all_cns.iter()
+                .filter(|c| !c.eq_ignore_ascii_case(&name))
+                .cloned()
+                .collect();
             groups.push(Group {
                 dn: e.dn.clone(),
                 name,
-                gid_number: first(&e, s.gid_number).and_then(|s| s.parse().ok()).unwrap_or(0),
+                aliases,
+                gid_number: first(&e, s.gid_number).and_then(|v| v.parse::<u32>().ok()),
                 members: e.attrs.get(s.member).cloned().unwrap_or_default(),
+                dup_name: false,
+                dup_gid: false,
             });
         }
+        flag_duplicates(&mut groups);
         groups.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(groups)
     }
@@ -406,6 +435,46 @@ impl LdapClient {
         Ok(())
     }
 
+    /// Read every user attribute of an entry as raw bytes (`*`, no operational
+    /// attributes), so it can be re-created verbatim later. Text and binary
+    /// attributes are merged into one `name → values` list. Used to capture the
+    /// pre-state of a delete for rollback.
+    pub fn read_entry_raw(&mut self, dn: &str) -> anyhow::Result<Vec<(String, Vec<Vec<u8>>)>> {
+        let (rs, _) = self.conn
+            .search(dn, Scope::Base, "(objectClass=*)", vec!["*"])
+            .context("Read entry failed")?
+            .success()
+            .context("Read entry rejected")?;
+        let Some(entry) = rs.into_iter().next() else {
+            anyhow::bail!("Entry {dn} not found");
+        };
+        let e = SearchEntry::construct(entry);
+        let mut attrs: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+        for (name, vals) in e.attrs {
+            attrs.push((name, vals.into_iter().map(String::into_bytes).collect()));
+        }
+        for (name, vals) in e.bin_attrs {
+            attrs.push((name, vals));
+        }
+        Ok(attrs)
+    }
+
+    /// Re-create an entry from raw captured attributes (the inverse of a delete).
+    pub fn add_raw(&mut self, dn: &str, attrs: &[(String, Vec<Vec<u8>>)]) -> anyhow::Result<()> {
+        let add_attrs: Vec<(&[u8], HashSet<&[u8]>)> = attrs.iter()
+            .map(|(name, vals)| {
+                let set: HashSet<&[u8]> = vals.iter().map(Vec::as_slice).collect();
+                (name.as_bytes(), set)
+            })
+            .collect();
+        self.conn
+            .add(dn, add_attrs)
+            .context("Restore add failed")?
+            .success()
+            .context("Restore add rejected")?;
+        Ok(())
+    }
+
     pub fn close(mut self) -> anyhow::Result<()> {
         self.conn.unbind().context("Unbind failed")?;
         Ok(())
@@ -416,6 +485,47 @@ impl LdapClient {
 
 fn first(entry: &SearchEntry, attr: &str) -> Option<String> {
     entry.attrs.get(attr)?.first().cloned()
+}
+
+/// Mark groups whose `cn` (any value — name or alias, case-insensitive) or
+/// `gidNumber` collides with another group in the set. This catches the subtle
+/// case where one group's *alias* `cn` shadows another group's primary name (e.g.
+/// `cn=lofar` also carrying `cn: cobalt`, colliding with the separate `cn=cobalt`).
+/// The synthetic "(no cn)" placeholder is excluded from name collisions.
+fn flag_duplicates(groups: &mut [Group]) {
+    use std::collections::{HashMap, HashSet};
+
+    // Every distinct cn value a group carries, lowercased, minus the placeholder.
+    let cns_of = |g: &Group| -> HashSet<String> {
+        std::iter::once(&g.name)
+            .chain(g.aliases.iter())
+            .filter(|c| *c != "(no cn)")
+            .map(|c| c.to_lowercase())
+            .collect()
+    };
+
+    let mut name_counts: HashMap<String, u32> = HashMap::new();
+    let mut gid_counts:  HashMap<u32, u32>    = HashMap::new();
+    for g in groups.iter() {
+        for cn in cns_of(g) {
+            *name_counts.entry(cn).or_default() += 1;
+        }
+        if let Some(gid) = g.gid_number {
+            *gid_counts.entry(gid).or_default() += 1;
+        }
+    }
+    for g in groups.iter_mut() {
+        g.dup_name = cns_of(g).iter().any(|cn| name_counts.get(cn).copied().unwrap_or(0) > 1);
+        g.dup_gid  = g.gid_number.is_some_and(|gid| gid_counts.get(&gid).copied().unwrap_or(0) > 1);
+    }
+}
+
+/// The RDN attribute value of a DN, e.g. `cn=lofar,ou=groups,dc=…` → `lofar`.
+/// A minimal parser: first comma-delimited component, value after the first `=`.
+fn rdn_value(dn: &str) -> Option<String> {
+    let first = dn.split(',').next()?;
+    let (_attr, val) = first.split_once('=')?;
+    Some(val.trim().to_string())
 }
 
 /// Build a [`User`] from a search entry, reading attribute names from `schema`.
@@ -438,10 +548,11 @@ fn user_from_entry(e: SearchEntry, schema: &Schema) -> Option<User> {
     })
 }
 
-fn resolve_endpoint(cfg: &Config) -> anyhow::Result<(String, u16, Option<Tunnel>)> {
+fn resolve_endpoint(cfg: &Config) -> anyhow::Result<(String, u16, Option<Tunnel>, ConnVia)> {
     let tc: &TunnelConfig = &cfg.tunnel;
     if !tc.enabled {
-        return Ok((cfg.server.host.clone(), cfg.server.port, None));
+        let via = ConnVia::Direct { host: cfg.server.host.clone() };
+        return Ok((cfg.server.host.clone(), cfg.server.port, None, via));
     }
 
     let ssh_alias = tc.ssh_alias.as_deref().unwrap_or(cfg.server.host.as_str());
@@ -455,6 +566,55 @@ fn resolve_endpoint(cfg: &Config) -> anyhow::Result<(String, u16, Option<Tunnel>
         std::time::Duration::from_secs(10),
     )?;
 
+    let via = ConnVia::Tunnel { alias: ssh_alias.to_string(), reused: tun.is_reused() };
     let local_port = tun.local_port;
-    Ok(("127.0.0.1".into(), local_port, Some(tun)))
+    Ok(("127.0.0.1".into(), local_port, Some(tun), via))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(dn: &str, name: &str, aliases: &[&str], gid: Option<u32>) -> Group {
+        Group {
+            dn: dn.into(),
+            name: name.into(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            gid_number: gid,
+            members: vec![],
+            dup_name: false,
+            dup_gid: false,
+        }
+    }
+
+    #[test]
+    fn rdn_value_extracts_the_rdn() {
+        assert_eq!(rdn_value("cn=lofar,ou=groups,dc=lofar,dc=eu").as_deref(), Some("lofar"));
+        assert_eq!(rdn_value("cn=cblt,ou=groups,dc=lofar,dc=eu").as_deref(), Some("cblt"));
+        assert_eq!(rdn_value("bogus").as_deref(), None);
+    }
+
+    /// The live LOFAR collision: `cn=lofar` also carries `cn: cobalt` (gid 9000),
+    /// a separate `cn=cobalt` (gid 10000), and `cn=cblt` (gid 10000).
+    #[test]
+    fn flags_alias_and_gid_collisions() {
+        let mut groups = vec![
+            group("cn=lofar,ou=groups,dc=lofar,dc=eu",  "lofar",  &["cobalt"], Some(9000)),
+            group("cn=cobalt,ou=groups,dc=lofar,dc=eu", "cobalt", &[],         Some(10000)),
+            group("cn=cblt,ou=groups,dc=lofar,dc=eu",   "cblt",   &[],         Some(10000)),
+            group("cn=hpc,ou=groups,dc=lofar,dc=eu",    "hpc",    &[],         Some(10006)),
+        ];
+        flag_duplicates(&mut groups);
+        let by = |n: &str| groups.iter().find(|g| g.name == n).unwrap();
+
+        // "cobalt" appears as lofar's alias AND as a primary name → both flagged.
+        assert!(by("lofar").dup_name,  "lofar carries the shared alias 'cobalt'");
+        assert!(by("cobalt").dup_name, "cobalt's name is shadowed by lofar's alias");
+        // gid 10000 is shared by cobalt and cblt.
+        assert!(by("cobalt").dup_gid && by("cblt").dup_gid);
+        // lofar's gid 9000 and hpc are unique.
+        assert!(!by("lofar").dup_gid && !by("hpc").dup_gid && !by("hpc").dup_name);
+        // cblt's name is unique (only its gid collides).
+        assert!(!by("cblt").dup_name);
+    }
 }
