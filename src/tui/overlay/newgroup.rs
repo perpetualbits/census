@@ -1,6 +1,9 @@
 //! New-group form modal: collects a group name and gidNumber.
 
-use mullion::{line_edit, render_field, Buffer, FieldRender, KeyCode, KeyModifiers, Rect};
+use mullion::{
+    line_edit, render_field, render_validity, Buffer, FieldRender, FormLayout, FormRow, KeyCode,
+    KeyModifiers, Rect, TextCtx, Validity,
+};
 
 use crate::tui::draw::btxt;
 use crate::tui::theme::*;
@@ -62,30 +65,31 @@ impl NewGroupForm {
         btxt(buf, rect.x + 2, rect.y + rect.height - 1,
              " Tab:field  Enter:create  Esc:cancel ", s_dim());
 
-        let fx = rect.x + 2;
-        let fw = rect.width.saturating_sub(4);
-        field_line(buf, fx, rect.y + 1, fw, "name", &self.name, self.name_cur, self.field == 0);
-        field_line(buf, fx, rect.y + 3, fw, "gidNumber", &self.gid, self.gid_cur, self.field == 1);
+        // Two label:field rows (spaced) laid out with the mullion form primitive.
+        let layout = FormLayout { label_cols: 11, gap: 1, status_cols: 0, row_height: 2 };
+        let rows = layout.rows(Rect::new(rect.x + 2, rect.y + 1, rect.width.saturating_sub(4), 4), 2, TextCtx::LTR);
+
+        field_row(buf, "name", &self.name, self.name_cur, self.field == 0, &rows[0]);
+        field_row(buf, "gidNumber", &self.gid, self.gid_cur, self.field == 1, &rows[1]);
 
         if let Some(err) = &self.error {
-            btxt(buf, fx, rect.y + 5, &format!("⚠ {err}"), s_err());
+            let status = Rect::new(rect.x + 2, rect.y + 5, rect.width.saturating_sub(4), 1);
+            render_validity(buf, status, &Validity::Error(err.clone()), &mullion_theme());
         }
     }
 }
 
-/// One labelled field line; the active one shows the cursor.
-#[allow(clippy::too_many_arguments)] // a private render helper; args are all positional draw params
-fn field_line(buf: &mut Buffer, x: u16, y: u16, w: u16, label: &str, val: &str, cursor: usize, active: bool) {
-    let lab = format!("{label:>10}: ");
-    btxt(buf, x, y, &lab, if active { s_subhead() } else { s_dim() });
-    let vx = x + lab.len() as u16;
-    let vw = w.saturating_sub(lab.len() as u16);
+/// Render one labelled field into a resolved [`FormRow`]; the active one shows the cursor.
+fn field_row(buf: &mut Buffer, label: &str, val: &str, cursor: usize, active: bool, row: &FormRow) {
+    let lab = format!("{label}:");
+    let lx = row.label.x + row.label.width.saturating_sub(lab.chars().count() as u16);
+    btxt(buf, lx, row.label.y, &lab, if active { s_subhead() } else { s_dim() });
     let opts = FieldRender {
         style: s_normal(),
         cursor_style: if active { s_sel() } else { s_normal() },
         mask: None,
-        ctx: mullion::TextCtx::LTR,
+        ctx: TextCtx::LTR,
     };
     let mut scroll = 0;
-    render_field(buf, Rect::new(vx, y, vw, 1), val, cursor, &mut scroll, &opts);
+    render_field(buf, row.field, val, cursor, &mut scroll, &opts);
 }

@@ -3,7 +3,10 @@
 //! `Tab`/arrows move between fields, typing edits the focused field, `Enter`
 //! submits. On a validation error the form stays open with a red message.
 
-use mullion::{line_edit, render_field, Buffer, FieldRender, KeyCode, KeyModifiers, Rect};
+use mullion::{
+    focus_step, line_edit, render_field, render_validity, Buffer, Direction, FieldRender,
+    FormLayout, KeyCode, KeyModifiers, Rect, TextCtx, Validity,
+};
 
 use crate::ldap::client::NewUserSpec;
 use crate::tui::draw::btxt;
@@ -98,11 +101,8 @@ impl NewUserForm {
         use KeyCode::*;
         match key {
             Esc => OverlayResult::Cancel,
-            Tab | Down => { self.cursor = (self.cursor + 1) % self.fields.len(); OverlayResult::Stay }
-            BackTab | Up => {
-                self.cursor = (self.cursor + self.fields.len() - 1) % self.fields.len();
-                OverlayResult::Stay
-            }
+            Tab | Down => { self.cursor = focus_step(self.fields.len(), self.cursor, Direction::Down); OverlayResult::Stay }
+            BackTab | Up => { self.cursor = focus_step(self.fields.len(), self.cursor, Direction::Up); OverlayResult::Stay }
             Enter => match self.build() {
                 Ok(spec) => OverlayResult::Commit(Action::CreateUser(spec)),
                 Err(e)   => { self.error = Some(e); OverlayResult::Stay }
@@ -125,29 +125,33 @@ impl NewUserForm {
         btxt(buf, rect.x + 2, rect.y + rect.height - 1,
              " Tab:field  Enter:create  Esc:cancel ", s_dim());
 
-        let fx = rect.x + 2;
-        let fw = rect.width.saturating_sub(4);
-        for (i, f) in self.fields.iter().enumerate() {
-            let y = rect.y + 1 + i as u16;
+        // Lay the label:field rows out with the mullion form primitive.
+        let n = self.fields.len();
+        let form_area = Rect::new(rect.x + 2, rect.y + 1, rect.width.saturating_sub(4), n as u16);
+        let layout = FormLayout { label_cols: 11, gap: 1, status_cols: 0, row_height: 1 };
+        let rows = layout.rows(form_area, n, TextCtx::LTR);
+
+        for (i, (f, row)) in self.fields.iter().zip(&rows).enumerate() {
             let active = i == self.cursor;
-            let lab = format!("{:>10}: ", f.label);
-            btxt(buf, fx, y, &lab, if active { s_subhead() } else { s_dim() });
-            let vx = fx + lab.len() as u16;
-            let vw = fw.saturating_sub(lab.len() as u16);
+            // Label, right-aligned in its gutter.
+            let lab = format!("{}:", f.label);
+            let lx = row.label.x + row.label.width.saturating_sub(lab.chars().count() as u16);
+            btxt(buf, lx, row.label.y, &lab, if active { s_subhead() } else { s_dim() });
             let opts = FieldRender {
                 style: s_normal(),
                 cursor_style: if active { s_sel() } else { s_normal() },
                 mask: f.masked.then_some('•'),
-                ctx: mullion::TextCtx::LTR,
+                ctx: TextCtx::LTR,
             };
             let mut scroll = 0;
-            render_field(buf, Rect::new(vx, y, vw, 1), &f.value, f.cursor, &mut scroll, &opts);
+            render_field(buf, row.field, &f.value, f.cursor, &mut scroll, &opts);
         }
 
         if let Some(err) = &self.error {
-            let y = rect.y + 1 + self.fields.len() as u16;
+            let y = rect.y + 1 + n as u16;
             if y < rect.y + rect.height - 1 {
-                btxt(buf, fx, y, &format!("⚠ {err}"), s_err());
+                let status = Rect::new(rect.x + 2, y, rect.width.saturating_sub(4), 1);
+                render_validity(buf, status, &Validity::Error(err.clone()), &mullion_theme());
             }
         }
     }
