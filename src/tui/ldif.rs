@@ -63,6 +63,10 @@ pub fn action_ldif(action: &Action, base_dn: &str, schema: &Schema) -> String {
         }
         Action::DeleteEntry { dn, .. } | Action::DeleteGroup { dn, .. } =>
             format!("dn: {dn}\nchangetype: delete\n"),
+        Action::RemoveAlias { dn, alias, .. } =>
+            modify(dn, "delete: cn", &[attr_line("cn", alias.as_bytes())]),
+        Action::AddAlias { dn, alias, .. } =>
+            modify(dn, "add: cn", &[attr_line("cn", alias.as_bytes())]),
         Action::RestoreEntry { dn, attrs, .. } => {
             let mut body = Vec::new();
             for (attr, vals) in attrs {

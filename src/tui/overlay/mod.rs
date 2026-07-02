@@ -52,6 +52,10 @@ pub enum Action {
     CreateGroup { name: String, gid_number: u32 },
     /// Delete a group entry by DN.
     DeleteGroup { dn: String, name: String },
+    /// Remove one non-RDN `cn` value (an alias) from a group entry.
+    RemoveAlias { dn: String, alias: String, group: String },
+    /// Add a `cn` value to a group entry (the inverse of [`Action::RemoveAlias`]).
+    AddAlias { dn: String, alias: String, group: String },
     /// Re-create a previously-captured entry verbatim — the inverse of a delete,
     /// used by the undo stack. Values are raw bytes so binary attributes (e.g.
     /// `jpegPhoto`) round-trip. Never produced by an overlay; only by rollback.

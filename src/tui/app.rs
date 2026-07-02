@@ -388,6 +388,7 @@ fn handle_key(
             Down | Char('j') => app.groups_cur.down(app.groups().len()),
             Char('n') => open_new_group(app),
             Char('D') => open_delete_group(app),
+            Char('a') => open_remove_alias(app),
             Enter => {
                 app.selected_group = app.groups_cur.cursor;
                 app.mode = Mode::Membership;
@@ -535,6 +536,30 @@ fn open_delete_group(app: &mut App) {
     app.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::typed_dn(prompt, dn, action)));
 }
 
+/// Open a confirmation to remove the cursored group's first alias `cn` (an extra,
+/// non-RDN name). Undoable. Repeat to strip multiple aliases.
+fn open_remove_alias(app: &mut App) {
+    if !app.can_write_ui() {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let Some(group) = app.groups().get(app.groups_cur.cursor) else { return; };
+    let Some(alias) = group.aliases.first().cloned() else {
+        app.status = Some(("This group has no extra cn to remove".into(), false));
+        return;
+    };
+    let dn   = group.dn.clone();
+    let name = group.name.clone();
+    let more = if group.aliases.len() > 1 {
+        format!(" ({} more after this)", group.aliases.len() - 1)
+    } else {
+        String::new()
+    };
+    let prompt = format!("Remove extra name cn={alias} from {name}?{more}");
+    let action = Action::RemoveAlias { dn, alias, group: name };
+    app.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::yes_no(prompt, action)));
+}
+
 // ─── write chokepoint ─────────────────────────────────────────────────────────
 
 /// One-line description of the LDAP operation an action would perform (dry-run).
@@ -560,6 +585,10 @@ fn describe_action(action: &Action) -> String {
             format!("ADD group cn={name} (gidNumber={gid_number})"),
         Action::DeleteGroup { dn, .. } =>
             format!("DELETE {dn}"),
+        Action::RemoveAlias { dn, alias, .. } =>
+            format!("DELETE cn={alias} on {dn}"),
+        Action::AddAlias { dn, alias, .. } =>
+            format!("ADD cn={alias} on {dn}"),
         Action::RestoreEntry { dn, .. } =>
             format!("RESTORE {dn}"),
     }
@@ -684,6 +713,18 @@ fn apply(app: &mut App, action: &Action) -> anyhow::Result<bool> {
                 Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
             }
         }
+        Action::RemoveAlias { dn, alias, group } => {
+            match app.session_mut().client.modify_delete(dn, "cn", &[alias.as_str()]) {
+                Ok(()) => { app.session_mut().refresh_groups()?; app.select_group_by_dn(dn); app.status = Some((format!("Removed alias {alias} from {group}"), false)); true }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
+            }
+        }
+        Action::AddAlias { dn, alias, group } => {
+            match app.session_mut().client.modify_add(dn, "cn", &[alias.as_str()]) {
+                Ok(()) => { app.session_mut().refresh_groups()?; app.select_group_by_dn(dn); app.status = Some((format!("Restored alias {alias} on {group}"), false)); true }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
+            }
+        }
         Action::RestoreEntry { dn, attrs, label } => {
             match app.session_mut().client.add_raw(dn, attrs) {
                 Ok(()) => {
@@ -749,6 +790,14 @@ fn inverse_of(app: &mut App, action: &Action) -> Option<(String, Action)> {
             let attrs = app.session_mut().client.read_entry_raw(dn).ok()?;
             Some((format!("delete group {name}"), Action::RestoreEntry { dn: dn.clone(), attrs, label: name.clone() }))
         }
+        Action::RemoveAlias { dn, alias, group } => Some((
+            format!("remove alias {alias} from {group}"),
+            Action::AddAlias { dn: dn.clone(), alias: alias.clone(), group: group.clone() },
+        )),
+        Action::AddAlias { dn, alias, group } => Some((
+            format!("add alias {alias} to {group}"),
+            Action::RemoveAlias { dn: dn.clone(), alias: alias.clone(), group: group.clone() },
+        )),
         // Restoring is itself reversible (delete again), so undo of a restore works.
         Action::RestoreEntry { dn, label, .. } =>
             Some((format!("restore {label}"), Action::DeleteEntry { dn: dn.clone(), label: label.clone() })),
