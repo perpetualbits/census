@@ -1,8 +1,8 @@
 //! Low-level buffer drawing primitives shared across screens and overlays.
 
-use mullion::{render_scrollbar, style::Style, Buffer, Rect, ScrollMetrics};
+use mullion::{render_keyhints, render_scrollbar, style::Style, Buffer, Rect, ScrollMetrics, TextCtx};
 
-use super::theme::{s_border, s_dim};
+use super::theme::{mullion_theme, s_border, s_dim};
 
 /// Write a string at `(x, y)` in the given style.
 pub fn btxt(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
@@ -14,6 +14,12 @@ pub fn hline(buf: &mut Buffer, r: Rect) {
     for x in r.x..r.x + r.width {
         buf.set_string(x, r.y, "─", s_border());
     }
+}
+
+/// Draw a themed key-hint footer bar (`key label · …`) into row `y`, spanning
+/// `w` columns from `x`, via mullion's `render_keyhints` in census colours.
+pub fn keyhints(buf: &mut Buffer, x: u16, y: u16, w: u16, pairs: &[(&str, &str)]) {
+    render_keyhints(buf, Rect::new(x, y, w, 1), pairs, &mullion_theme(), TextCtx::LTR);
 }
 
 /// Fill `w` cells starting at `(x, y)` with spaces in `style` (row highlight).

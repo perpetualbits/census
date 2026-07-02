@@ -9,7 +9,7 @@ use mullion::{
 
 use crate::ldap::client::User;
 use crate::tui::app::App;
-use crate::tui::draw::{btxt, fill_row, hline, vscroll};
+use crate::tui::draw::{btxt, fill_row, hline, keyhints, vscroll};
 use crate::tui::focus::Pane;
 use crate::tui::theme::*;
 
@@ -53,12 +53,14 @@ pub fn render_select(app: &App, buf: &mut Buffer, area: Rect) {
                  if *is_err { s_err() } else { s_ok() });
         }
         None => {
-            let hint = if focus == Pane::Right {
-                " Tab:list  jk:attr  e:edit  r:rename  a:del-alias  u:undo  L:ldif  ?:help  Esc "
+            let pairs: &[(&str, &str)] = if focus == Pane::Right {
+                &[("Tab", "list"), ("jk", "attr"), ("e", "edit"), ("r", "rename"),
+                  ("a", "del-alias"), ("u", "undo"), ("L", "ldif"), ("?", "help"), ("Esc", "")]
             } else {
-                " Tab:detail  jk  Enter:members  n:new  D:del  a:alias  u:undo  L:ldif  ?:help  Esc "
+                &[("Tab", "detail"), ("jk", ""), ("Enter", "members"), ("n", "new"),
+                  ("D", "del"), ("a", "alias"), ("u", "undo"), ("L", "ldif"), ("?", "help"), ("Esc", "")]
             };
-            btxt(buf, area.x + 2, bottom, hint, s_dim());
+            keyhints(buf, area.x + 2, bottom, area.width.saturating_sub(4), pairs);
         }
     }
 
@@ -143,12 +145,14 @@ pub fn render_membership(app: &App, buf: &mut Buffer, area: Rect) {
                  if *is_err { s_err() } else { s_ok() });
         }
         None => {
-            let hints = if app.write_mode {
-                " Tab:switch  Enter:add/remove  u:undo  L:ldif  Esc:browse  q:quit "
+            let pairs: &[(&str, &str)] = if app.write_mode {
+                &[("Tab", "switch"), ("Enter", "add/remove"), ("u", "undo"),
+                  ("L", "ldif"), ("Esc", "browse"), ("q", "quit")]
             } else {
-                " Tab:switch  L:ldif  Esc:browse  q:quit  (read-only) "
+                &[("Tab", "switch"), ("L", "ldif"), ("Esc", "browse"),
+                  ("q", "quit"), ("", "(read-only)")]
             };
-            btxt(buf, area.x + 2, bottom, hints, s_dim());
+            keyhints(buf, area.x + 2, bottom, area.width.saturating_sub(4), pairs);
         }
     }
 

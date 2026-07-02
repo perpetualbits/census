@@ -37,3 +37,21 @@ pub fn s_err()     -> Style { Style::default().fg(C_ERR) }
 pub fn box_style() -> BorderStyle {
     BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_border() }
 }
+
+/// Census's palette mapped onto mullion's semantic [`Theme`](mullion::Theme) roles,
+/// so the round-2 render helpers (`render_keyhints`, `render_validity`,
+/// `render_diff_unified`, …) paint in census colours.
+pub fn mullion_theme() -> mullion::Theme {
+    mullion::Theme {
+        border:         s_border(),
+        border_focused: s_subhead(),
+        text:           s_normal(),
+        text_dim:       s_dim(),
+        accent:         s_subhead(),
+        selection:      s_sel(),
+        heading:        s_head(),
+        ok:             s_ok(),
+        warn:           s_warn(),
+        error:          s_err(),
+    }
+}

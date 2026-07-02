@@ -8,7 +8,7 @@ use mullion::{
 };
 
 use crate::tui::app::App;
-use crate::tui::draw::{btxt, fill_row, hline, vscroll};
+use crate::tui::draw::{btxt, fill_row, hline, keyhints, vscroll};
 use crate::tui::focus::Pane;
 use crate::tui::theme::*;
 
@@ -46,14 +46,18 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focus: Pane) {
                  if *is_err { s_err() } else { s_ok() });
         }
         None => {
-            let hint = if focus == Pane::Right {
-                " Tab:pane  jk:attr  e:edit  K:keys  p:passwd  u:undo  L:ldif  ?:help  q:quit "
+            let pairs: &[(&str, &str)] = if focus == Pane::Right {
+                &[("Tab", "pane"), ("jk", "attr"), ("e", "edit"), ("K", "keys"),
+                  ("p", "passwd"), ("u", "undo"), ("L", "ldif"), ("?", "help"), ("q", "quit")]
             } else {
-                " Tab:pane  jk:users  n:new  D:del  g:groups  u:undo  L:ldif  ?:help  q:quit "
+                &[("Tab", "pane"), ("jk", "users"), ("n", "new"), ("D", "del"),
+                  ("g", "groups"), ("u", "undo"), ("L", "ldif"), ("?", "help"), ("q", "quit")]
             };
-            btxt(buf, area.x + 2, bottom, hint, s_dim());
             let count = format!(" {} users ", app.users().len());
-            let cx = area.x + area.width.saturating_sub(1 + count.len() as u16);
+            let cw = count.chars().count() as u16;
+            let hint_w = area.width.saturating_sub(4).saturating_sub(cw);
+            keyhints(buf, area.x + 2, bottom, hint_w, pairs);
+            let cx = area.x + area.width.saturating_sub(1 + cw);
             btxt(buf, cx, bottom, &count, s_dim());
         }
     }
