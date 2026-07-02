@@ -66,6 +66,14 @@ pub struct NewUserSpec {
     pub password: Option<String>,
 }
 
+/// One child entry in the directory tree, for the DIT browser.
+#[derive(Debug, Clone)]
+pub struct DitNode {
+    pub dn: String,
+    /// The RDN value, shown as the tree label (e.g. `ou=users` → `users`).
+    pub rdn: String,
+}
+
 impl LdapClient {
     pub fn connect(cfg: &Config, password: Option<&str>) -> anyhow::Result<Self> {
         let (host, port, tun, conn_via) = resolve_endpoint(cfg)?;
@@ -495,6 +503,43 @@ impl LdapClient {
         Ok(())
     }
 
+    // ---------- DIT browser -------------------------------------------------
+
+    /// One level of children directly under `base` (for the tree browser). Sorted
+    /// by RDN. An empty result means `base` is a leaf.
+    pub fn list_children(&mut self, base: &str) -> anyhow::Result<Vec<DitNode>> {
+        let (rs, _) = self.conn
+            .search(base, Scope::OneLevel, "(objectClass=*)", vec!["1.1"])
+            .context("DIT children search failed")?
+            .success()
+            .context("DIT children search rejected")?;
+        let mut out = Vec::new();
+        for entry in rs {
+            let e = SearchEntry::construct(entry);
+            let rdn = rdn_value(&e.dn).unwrap_or_else(|| e.dn.clone());
+            out.push(DitNode { dn: e.dn, rdn });
+        }
+        out.sort_by_key(|n| n.rdn.to_lowercase());
+        Ok(out)
+    }
+
+    /// An entry's attributes as displayable strings (binary values shown as a
+    /// `(binary, N bytes)` placeholder), for the DIT detail pane.
+    pub fn read_entry_display(&mut self, dn: &str) -> anyhow::Result<Vec<(String, Vec<String>)>> {
+        let raw = self.read_entry_raw(dn)?;
+        let mut out: Vec<(String, Vec<String>)> = raw.into_iter()
+            .map(|(name, vals)| {
+                let shown = vals.into_iter().map(|v| match String::from_utf8(v) {
+                    Ok(s) => s,
+                    Err(e) => format!("(binary, {} bytes)", e.into_bytes().len()),
+                }).collect();
+                (name, shown)
+            })
+            .collect();
+        out.sort_by_key(|(k, _)| k.to_lowercase());
+        Ok(out)
+    }
+
     pub fn close(mut self) -> anyhow::Result<()> {
         self.conn.unbind().context("Unbind failed")?;
         Ok(())
@@ -542,7 +587,7 @@ fn flag_duplicates(groups: &mut [Group]) {
 
 /// The RDN attribute value of a DN, e.g. `cn=lofar,ou=groups,dc=…` → `lofar`.
 /// A minimal parser: first comma-delimited component, value after the first `=`.
-fn rdn_value(dn: &str) -> Option<String> {
+pub fn rdn_value(dn: &str) -> Option<String> {
     let first = dn.split(',').next()?;
     let (_attr, val) = first.split_once('=')?;
     Some(val.trim().to_string())

@@ -1,11 +1,12 @@
 //! TUI orchestrator: application state, event loop, key routing, render dispatch.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, MouseEventKind};
 use mullion::{backend::CrosstermBackend, Buffer, EventReader, KeyCode, KeyModifiers, Rect, Terminal};
 
-use crate::ldap::client::{Group, User};
+use crate::ldap::client::{DitNode, Group, User};
 use crate::session::Session;
 
 use super::focus::{ListCursor, Pane};
@@ -21,7 +22,20 @@ const RENDER_TICK: Duration = Duration::from_millis(50);
 // ─── state ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode { Browse, GroupSelect, Membership }
+enum Mode { Browse, GroupSelect, Membership, Dit }
+
+/// One flattened row of the DIT tree browser (built from the children cache +
+/// expand-set each frame).
+pub struct DitRow {
+    pub dn: String,
+    pub label: String,
+    /// For each ancestor level, whether that ancestor was its parent's last child
+    /// (drives `│` vs blank guide columns in [`mullion::render_tree_row`]).
+    pub ancestor_last: Vec<bool>,
+    pub is_last: bool,
+    /// `Some(false)` collapsed, `Some(true)` expanded, `None` leaf (fetched, no kids).
+    pub expanded: Option<bool>,
+}
 
 pub struct App {
     sessions: Vec<Session>,
@@ -42,6 +56,15 @@ pub struct App {
     pub group_browse_focus: Pane,
     pub group_detail_cur: usize,
     pub group_detail_scroll: usize,
+
+    // DIT tree browser.
+    pub dit_focus: Pane,
+    pub dit_cur: ListCursor,
+    pub dit_detail_cur: usize,
+    dit_children: HashMap<String, Vec<DitNode>>, // parent DN → its children (lazy cache)
+    dit_expanded: HashSet<String>,               // DNs currently expanded
+    dit_rows: Vec<DitRow>,                        // flattened visible rows (rebuilt on change)
+    dit_detail: Vec<(String, Vec<String>)>,      // selected entry's attributes
 
     selected_group: usize,
     pub active_pane: Pane,
@@ -76,6 +99,13 @@ impl App {
             group_browse_focus: Pane::Left,
             group_detail_cur: 0,
             group_detail_scroll: 0,
+            dit_focus: Pane::Left,
+            dit_cur: ListCursor::new(),
+            dit_detail_cur: 0,
+            dit_children: HashMap::new(),
+            dit_expanded: HashSet::new(),
+            dit_rows: Vec::new(),
+            dit_detail: Vec::new(),
             selected_group: 0,
             active_pane: Pane::Left,
             left_cur: ListCursor::new(),
@@ -122,6 +152,140 @@ impl App {
 
     /// Count of undoable steps on the stack (shown in the preview header).
     pub fn undo_depth(&self) -> usize { self.journal.undo.len() }
+
+    // ── DIT tree browser ─────────────────────────────────────────────────────
+
+    pub fn dit_rows(&self) -> &[DitRow] { &self.dit_rows }
+    pub fn dit_detail(&self) -> &[(String, Vec<String>)] { &self.dit_detail }
+    pub fn dit_base(&self) -> String { self.session().client.base_dn.clone() }
+
+    /// Enter the browser: fetch the base DN's children as the top level.
+    fn enter_dit(&mut self) {
+        self.dit_focus = Pane::Left;
+        self.dit_cur.reset();
+        self.dit_detail_cur = 0;
+        self.dit_children.clear();
+        self.dit_expanded.clear();
+        let base = self.dit_base();
+        if let Ok(kids) = self.session_mut().client.list_children(&base) {
+            self.dit_children.insert(base, kids);
+        }
+        self.rebuild_dit_rows();
+        self.load_dit_detail();
+    }
+
+    /// Rebuild the flattened visible rows from the children cache + expand-set.
+    fn rebuild_dit_rows(&mut self) {
+        let base = self.dit_base();
+        let mut rows = Vec::new();
+        if let Some(top) = self.dit_children.get(&base).cloned() {
+            let n = top.len();
+            for (i, node) in top.iter().enumerate() {
+                self.walk_dit(node, &[], i + 1 == n, &mut rows);
+            }
+        }
+        self.dit_rows = rows;
+    }
+
+    fn walk_dit(&self, node: &DitNode, ancestor_last: &[bool], is_last: bool, rows: &mut Vec<DitRow>) {
+        let fetched = self.dit_children.contains_key(&node.dn);
+        let kids = self.dit_children.get(&node.dn);
+        let expanded = if fetched && kids.is_none_or(|c| c.is_empty()) {
+            None // fetched with no children → leaf
+        } else if self.dit_expanded.contains(&node.dn) {
+            Some(true)
+        } else {
+            Some(false)
+        };
+        rows.push(DitRow {
+            dn: node.dn.clone(),
+            label: node.rdn.clone(),
+            ancestor_last: ancestor_last.to_vec(),
+            is_last,
+            expanded,
+        });
+        if self.dit_expanded.contains(&node.dn) {
+            if let Some(children) = kids {
+                let m = children.len();
+                let mut al = ancestor_last.to_vec();
+                al.push(is_last);
+                for (i, kid) in children.iter().enumerate() {
+                    self.walk_dit(kid, &al, i + 1 == m, rows);
+                }
+            }
+        }
+    }
+
+    fn dit_selected_dn(&self) -> Option<String> {
+        self.dit_rows.get(self.dit_cur.cursor).map(|r| r.dn.clone())
+    }
+
+    /// Load the selected entry's attributes into the detail pane.
+    fn load_dit_detail(&mut self) {
+        self.dit_detail_cur = 0;
+        match self.dit_selected_dn() {
+            Some(dn) => {
+                self.dit_detail = self.session_mut().client.read_entry_display(&dn).unwrap_or_default();
+            }
+            None => self.dit_detail.clear(),
+        }
+    }
+
+    /// Expand (fetching children on first open) or collapse the selected node.
+    fn dit_toggle(&mut self) {
+        let Some(dn) = self.dit_selected_dn() else { return; };
+        if self.dit_expanded.contains(&dn) {
+            self.dit_expanded.remove(&dn);
+        } else {
+            if !self.dit_children.contains_key(&dn) {
+                match self.session_mut().client.list_children(&dn) {
+                    Ok(kids) => { self.dit_children.insert(dn.clone(), kids); }
+                    Err(e) => { self.status = Some((format!("expand failed: {e}"), true)); return; }
+                }
+            }
+            if self.dit_children.get(&dn).is_some_and(|c| !c.is_empty()) {
+                self.dit_expanded.insert(dn);
+            }
+        }
+        self.rebuild_dit_rows();
+        self.dit_cur.clamp(self.dit_rows.len());
+    }
+
+    fn dit_collapse(&mut self) {
+        if let Some(dn) = self.dit_selected_dn() {
+            if self.dit_expanded.remove(&dn) {
+                self.rebuild_dit_rows();
+                self.dit_cur.clamp(self.dit_rows.len());
+            }
+        }
+    }
+
+    /// Re-fetch expanded nodes after a write and rebuild the tree + detail.
+    fn refresh_dit(&mut self) {
+        let base = self.dit_base();
+        let mut targets: Vec<String> = vec![base];
+        targets.extend(self.dit_expanded.iter().cloned());
+        self.dit_children.clear();
+        for dn in targets {
+            if let Ok(kids) = self.session_mut().client.list_children(&dn) {
+                self.dit_children.insert(dn, kids);
+            }
+        }
+        self.rebuild_dit_rows();
+        self.dit_cur.clamp(self.dit_rows.len());
+        self.load_dit_detail();
+    }
+
+    /// Editable attributes of the DIT-selected entry (single-valued, admin-safe).
+    pub fn dit_edit_targets(&self) -> Vec<(String, String)> {
+        const SKIP: &[&str] = &["objectClass", "userPassword", "structuralObjectClass",
+                                "entryUUID", "entryCSN", "creatorsName", "modifiersName"];
+        self.dit_detail.iter()
+            .filter(|(k, v)| v.len() == 1 && !SKIP.contains(&k.as_str())
+                             && !v[0].starts_with("(binary,"))
+            .map(|(k, v)| (k.clone(), v[0].clone()))
+            .collect()
+    }
 
     /// The decoded portrait for the cursored user, if it carries a `jpegPhoto`.
     pub fn detail_photo(&self) -> Option<&mullion::video::Frame> { self.detail_photo.as_ref() }
@@ -278,6 +442,10 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind) {
             Pane::Left  => if down { app.left_cur.down(app.users().len()); } else { app.left_cur.up() },
             Pane::Right => if down { app.right_cur.down(app.member_list().len()); } else { app.right_cur.up() },
         },
+        Mode::Dit => {
+            if down { app.dit_cur.down(app.dit_rows.len()); } else { app.dit_cur.up(); }
+            app.load_dit_detail();
+        }
     }
 }
 
@@ -295,6 +463,10 @@ fn update_offsets(app: &mut App, area: Rect) {
     let rlen = app.member_uids().len();
     app.right_cur.clamp(rlen);
     app.right_cur.keep_in_view(rlen, vis);
+
+    let ndit = app.dit_rows.len();
+    app.dit_cur.clamp(ndit);
+    app.dit_cur.keep_in_view(ndit, vis);
 
     // Detail body height = inner(area-2) - header(1) - sep(1) = vis - 2, minus the
     // portrait band (photo rows + a gap) when the cursored user has a jpegPhoto.
@@ -399,6 +571,7 @@ fn handle_key(
                 app.group_browse_focus = Pane::Left;
                 app.reset_group_detail();
             }
+            (_, Char('t')) => { app.mode = Mode::Dit; app.enter_dit(); }
             (_, Char('n')) => open_new_user(app),
             (_, Char('D')) => open_delete_user(app),
             (_, Tab) | (_, BackTab) => {
@@ -417,6 +590,7 @@ fn handle_key(
                 if app.detail_cur + 1 < n { app.detail_cur += 1; }
             }
             (Pane::Right, Char('e')) => open_attr_edit(app),
+            (Pane::Right, Char('E')) => open_attr_bigedit(app),
             (Pane::Right, Char('K')) => open_key_editor(app),
             (Pane::Right, Char('p')) => open_passwd(app),
             _ => {}
@@ -454,6 +628,7 @@ fn handle_key(
                 if app.group_detail_cur + 1 < n { app.group_detail_cur += 1; }
             }
             (Pane::Right, Char('e')) => open_group_attr_edit(app),
+            (Pane::Right, Char('E')) => open_group_attr_bigedit(app),
             _ => {}
         },
 
@@ -480,8 +655,63 @@ fn handle_key(
             }
             _ => {}
         },
+
+        Mode::Dit => match (app.dit_focus, key) {
+            (_, Char('q')) => return Ok(true),
+            (Pane::Right, Esc) => app.dit_focus = Pane::Left,
+            (Pane::Left,  Esc) => app.mode = Mode::Browse,
+            (_, Tab) | (_, BackTab) => {
+                app.dit_focus = if app.dit_focus == Pane::Left { Pane::Right } else { Pane::Left };
+            }
+            // Left pane: navigate/expand the tree.
+            (Pane::Left, Up   | Char('k')) => { app.dit_cur.up();                      app.load_dit_detail(); }
+            (Pane::Left, Down | Char('j')) => { app.dit_cur.down(app.dit_rows.len());   app.load_dit_detail(); }
+            (Pane::Left, PageUp)   => { app.dit_cur.page(-10, app.dit_rows.len()); app.load_dit_detail(); }
+            (Pane::Left, PageDown) => { app.dit_cur.page(10, app.dit_rows.len());  app.load_dit_detail(); }
+            (Pane::Left, Enter | Char('l') | Right) => app.dit_toggle(),
+            (Pane::Left, Char('h') | Left) => app.dit_collapse(),
+            // Entry actions (either pane): delete, edit an attribute.
+            (_, Char('D')) => open_dit_delete(app),
+            (Pane::Right, Up   | Char('k')) => app.dit_detail_cur = app.dit_detail_cur.saturating_sub(1),
+            (Pane::Right, Down | Char('j')) => {
+                let n = app.dit_edit_targets().len();
+                if app.dit_detail_cur + 1 < n { app.dit_detail_cur += 1; }
+            }
+            (Pane::Right, Char('e')) => open_dit_attr_edit(app, false),
+            (Pane::Right, Char('E')) => open_dit_attr_edit(app, true),
+            _ => {}
+        },
     }
     Ok(false)
+}
+
+/// Open a typed-DN delete confirmation for the DIT-selected entry.
+fn open_dit_delete(app: &mut App) {
+    if !app.can_write_ui() {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let Some(dn) = app.dit_selected_dn() else { return; };
+    let label = app.dit_rows().get(app.dit_cur.cursor).map(|r| r.label.clone()).unwrap_or_else(|| dn.clone());
+    let prompt = format!("Delete {label}? Irreversible.");
+    let action = Action::DeleteEntry { dn: dn.clone(), label };
+    app.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::typed_dn(prompt, dn, action)));
+}
+
+/// Edit the DIT-selected entry's cursored attribute (single-line or `big` textarea).
+fn open_dit_attr_edit(app: &mut App, big: bool) {
+    if !app.can_write_ui() {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let targets = app.dit_edit_targets();
+    let Some((attr, value)) = targets.get(app.dit_detail_cur).cloned() else { return; };
+    let Some(dn) = app.dit_selected_dn() else { return; };
+    app.overlay = Some(if big {
+        Overlay::TextArea(overlay::TextAreaDialog::edit_attr(dn, attr, &value))
+    } else {
+        Overlay::Input(overlay::InputDialog::edit_attr(dn, attr, &value))
+    });
 }
 
 fn do_membership_action(app: &mut App) -> anyhow::Result<()> {
@@ -522,6 +752,19 @@ fn open_attr_edit(app: &mut App) {
     let dn = match app.detail() { Some(u) => u.dn.clone(), None => return };
     let dlg = overlay::InputDialog::edit_attr(dn, target.attr.clone(), &target.value);
     app.overlay = Some(Overlay::Input(dlg));
+}
+
+/// Open the multi-line "big edit" textarea for the detail pane's selected attribute.
+fn open_attr_bigedit(app: &mut App) {
+    if !app.can_write_ui() {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let targets = screens::detail::edit_targets(app);
+    let Some(target) = targets.get(app.detail_cur) else { return; };
+    let dn = match app.detail() { Some(u) => u.dn.clone(), None => return };
+    let dlg = overlay::TextAreaDialog::edit_attr(dn, target.attr.clone(), &target.value);
+    app.overlay = Some(Overlay::TextArea(dlg));
 }
 
 /// Open the SSH-key manager for the cursored user.
@@ -605,6 +848,19 @@ fn open_group_attr_edit(app: &mut App) {
     let Some(group) = app.groups().get(app.groups_cur.cursor) else { return; };
     let dlg = overlay::InputDialog::edit_attr(group.dn.clone(), target.attr.clone(), &target.value);
     app.overlay = Some(Overlay::Input(dlg));
+}
+
+/// Open the multi-line "big edit" textarea for the group detail pane's selected attribute.
+fn open_group_attr_bigedit(app: &mut App) {
+    if !app.can_write_ui() {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let targets = screens::group_detail::edit_targets(app);
+    let Some(target) = targets.get(app.group_detail_cur) else { return; };
+    let Some(group) = app.groups().get(app.groups_cur.cursor) else { return; };
+    let dlg = overlay::TextAreaDialog::edit_attr(group.dn.clone(), target.attr.clone(), &target.value);
+    app.overlay = Some(Overlay::TextArea(dlg));
 }
 
 /// Open the rename dialog (cn/RDN via modrdn) for the cursored group.
@@ -703,6 +959,10 @@ fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
         record_action(app, &action);
         if let Some((label, inv)) = inverse {
             app.journal.undo.push(journal::UndoStep { label, inverse: inv });
+        }
+        // A write from (or undone within) the DIT browser must refresh the tree.
+        if app.mode == Mode::Dit {
+            app.refresh_dit();
         }
     }
     Ok(())
@@ -994,6 +1254,7 @@ fn render(app: &App, buf: &mut Buffer) {
         Mode::Browse      => screens::users::render(app, buf, main, app.browse_focus),
         Mode::GroupSelect => screens::groups::render_select(app, buf, main),
         Mode::Membership  => screens::groups::render_membership(app, buf, main),
+        Mode::Dit         => screens::dit::render(app, buf, main),
     }
     if let Some(pa) = preview {
         screens::preview::render(app, buf, pa);
