@@ -54,8 +54,8 @@ pub fn render_select(app: &App, buf: &mut Buffer, area: Rect) {
         }
         None => {
             let pairs: &[(&str, &str)] = if focus == Pane::Right {
-                &[("Tab", "list"), ("jk", "attr"), ("e", "edit"), ("r", "rename"),
-                  ("a", "del-alias"), ("u", "undo"), ("L", "ldif"), ("?", "help"), ("Esc", "")]
+                &[("Tab", "list"), ("jk", "attr"), ("e", "edit"), ("E", "big-edit"), ("r", "rename"),
+                  ("a", "del-alias"), ("u", "undo"), ("?", "help"), ("Esc", "")]
             } else {
                 &[("Tab", "detail"), ("jk", ""), ("Enter", "members"), ("n", "new"),
                   ("D", "del"), ("a", "alias"), ("u", "undo"), ("L", "ldif"), ("?", "help"), ("Esc", "")]
@@ -190,7 +190,7 @@ fn render_user_pane(app: &App, buf: &mut Buffer, area: Rect, active: bool) {
 
         if sel { fill_row(buf, content.x, y, content.width, sty); }
         ColumnGrid::write_text(buf, cols[0], y, &user.uid, Align::Start, sty);
-        ColumnGrid::write_text(buf, cols[2], y, &user.cn,  Align::Start, sty);
+        ColumnGrid::write_text_ctx(buf, cols[2], y, &user.cn, Align::Start, sty, dctx());
     }
 }
 
@@ -213,7 +213,7 @@ fn render_member_pane(app: &App, buf: &mut Buffer, content: Rect, members: &[&Us
         let sty = if sel { s_sel() } else if active { s_normal() } else { s_dim() };
         if sel { fill_row(buf, rows.x, y, rows.width, sty); }
         ColumnGrid::write_text(buf, cols[0], y, &user.uid, Align::Start, sty);
-        ColumnGrid::write_text(buf, cols[2], y, &user.cn,  Align::Start, sty);
+        ColumnGrid::write_text_ctx(buf, cols[2], y, &user.cn, Align::Start, sty, dctx());
     }
 }
 

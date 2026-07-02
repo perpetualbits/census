@@ -47,11 +47,11 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focus: Pane) {
         }
         None => {
             let pairs: &[(&str, &str)] = if focus == Pane::Right {
-                &[("Tab", "pane"), ("jk", "attr"), ("e", "edit"), ("K", "keys"),
+                &[("Tab", "pane"), ("jk", "attr"), ("e", "edit"), ("E", "big-edit"), ("K", "keys"),
                   ("p", "passwd"), ("u", "undo"), ("L", "ldif"), ("?", "help"), ("q", "quit")]
             } else {
                 &[("Tab", "pane"), ("jk", "users"), ("n", "new"), ("D", "del"),
-                  ("g", "groups"), ("u", "undo"), ("L", "ldif"), ("?", "help"), ("q", "quit")]
+                  ("g", "groups"), ("t", "tree"), ("u", "undo"), ("?", "help"), ("q", "quit")]
             };
             let count = format!(" {} users ", app.users().len());
             let cw = count.chars().count() as u16;
@@ -89,7 +89,7 @@ fn render_list(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
         let sty = if sel { s_sel() } else if focused { s_normal() } else { s_dim() };
         if sel { fill_row(buf, content.x, y, content.width, sty); }
         ColumnGrid::write_text(buf, cols[0], y, &user.uid, Align::Start, sty);
-        ColumnGrid::write_text(buf, cols[2], y, &user.cn,  Align::Start, sty);
+        ColumnGrid::write_text_ctx(buf, cols[2], y, &user.cn, Align::Start, sty, dctx());
     }
 }
 

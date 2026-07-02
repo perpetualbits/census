@@ -141,7 +141,7 @@ impl NewUserForm {
                 style: s_normal(),
                 cursor_style: if active { s_sel() } else { s_normal() },
                 mask: f.masked.then_some('•'),
-                ctx: TextCtx::LTR,
+                ctx: dctx(),
             };
             let mut scroll = 0;
             render_field(buf, row.field, &f.value, f.cursor, &mut scroll, &opts);

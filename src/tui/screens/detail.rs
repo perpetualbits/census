@@ -96,7 +96,7 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
             Row::Kv(k, v) => {
                 let (ks, vs) = if sel { (s_sel(), s_sel()) } else { (s_dim(), s_normal()) };
                 ColumnGrid::write_text(buf, cols[0], y, k, Align::Start, ks);
-                ColumnGrid::write_text(buf, cols[2], y, v, Align::Start, vs);
+                ColumnGrid::write_text_ctx(buf, cols[2], y, v, Align::Start, vs, dctx());
             }
             Row::Text(t) => btxt(buf, content.x + 2, y, t, if sel { s_sel() } else { s_normal() }),
             Row::Blank => {}

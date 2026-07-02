@@ -38,6 +38,15 @@ pub fn box_style() -> BorderStyle {
     BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_border() }
 }
 
+/// The base text context for rendering/editing directory **data** (attribute
+/// values). `BaseDirection::Auto` detects each value's direction from its first
+/// strong character, so a Hebrew/Arabic `cn` renders right-to-left next to an ASCII
+/// `uid` with no configuration — LDAP is inherently mixed-locale. Chrome/labels stay
+/// LTR (they use plain `write_text`).
+pub fn dctx() -> mullion::TextCtx {
+    mullion::TextCtx { base: mullion::BaseDirection::Auto, digits: mullion::DigitShaping::None }
+}
+
 /// Census's palette mapped onto mullion's semantic [`Theme`](mullion::Theme) roles,
 /// so the round-2 render helpers (`render_keyhints`, `render_validity`,
 /// `render_diff_unified`, …) paint in census colours.

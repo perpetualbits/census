@@ -88,7 +88,7 @@ fn field_row(buf: &mut Buffer, label: &str, val: &str, cursor: usize, active: bo
         style: s_normal(),
         cursor_style: if active { s_sel() } else { s_normal() },
         mask: None,
-        ctx: TextCtx::LTR,
+        ctx: dctx(),
     };
     let mut scroll = 0;
     render_field(buf, row.field, val, cursor, &mut scroll, &opts);

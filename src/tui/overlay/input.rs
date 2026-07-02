@@ -1,6 +1,9 @@
 //! Single-line text input modal (attribute editing, and later form fields).
 
-use mullion::{line_edit, render_field, Buffer, FieldRender, KeyCode, KeyModifiers, Rect};
+use mullion::{
+    line_edit, render_field, visual_step, Buffer, Direction, FieldRender, KeyCode, KeyModifiers,
+    Rect, TextCtx,
+};
 
 use crate::tui::draw::btxt;
 use crate::tui::theme::*;
@@ -24,6 +27,9 @@ pub struct InputDialog {
     value: String,
     cursor: usize, // byte index into `value`, kept on a grapheme boundary
     masked: bool,
+    /// Base direction for the field: caret motion follows *visual* order and the
+    /// glyphs shape for this context. `dctx()` (auto-detect) so RTL/mixed values edit right.
+    ctx: TextCtx,
     target: Target,
 }
 
@@ -38,6 +44,7 @@ impl InputDialog {
             cursor: value.len(),
             value,
             masked: false,
+            ctx: dctx(),
             target: Target::Attr { dn: dn.into(), attr },
         }
     }
@@ -52,6 +59,7 @@ impl InputDialog {
             target: Target::Rename { dn: dn.into(), old_name: value.clone() },
             value,
             masked: false,
+            ctx: dctx(),
         }
     }
 
@@ -82,7 +90,20 @@ impl InputDialog {
                     }
                 }
             }
-            // Everything else is grapheme-aware line editing.
+            // Bidi-correct caret motion: Left/Right follow visual order.
+            Left => {
+                if let Some(c) = visual_step(&self.value, self.cursor, Direction::Left, self.ctx) {
+                    self.cursor = c;
+                }
+                OverlayResult::Stay
+            }
+            Right => {
+                if let Some(c) = visual_step(&self.value, self.cursor, Direction::Right, self.ctx) {
+                    self.cursor = c;
+                }
+                OverlayResult::Stay
+            }
+            // Everything else (insert/delete/Home/End) is grapheme-aware line editing.
             _ => { line_edit(&mut self.value, &mut self.cursor, key); OverlayResult::Stay }
         }
     }
@@ -100,7 +121,7 @@ impl InputDialog {
             style: s_normal(),
             cursor_style: s_sel(),
             mask: self.masked.then_some('•'),
-            ctx: mullion::TextCtx::LTR,
+            ctx: self.ctx,
         };
         let mut scroll = 0;
         render_field(buf, field, &self.value, self.cursor, &mut scroll, &opts);
