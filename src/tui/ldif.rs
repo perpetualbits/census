@@ -63,6 +63,8 @@ pub fn action_ldif(action: &Action, base_dn: &str, schema: &Schema) -> String {
         }
         Action::DeleteEntry { dn, .. } | Action::DeleteGroup { dn, .. } =>
             format!("dn: {dn}\nchangetype: delete\n"),
+        Action::RenameGroup { dn, new_cn, .. } =>
+            format!("dn: {dn}\nchangetype: modrdn\nnewrdn: cn={new_cn}\ndeleteoldrdn: 1\n"),
         Action::RemoveAlias { dn, alias, .. } =>
             modify(dn, "delete: cn", &[attr_line("cn", alias.as_bytes())]),
         Action::AddAlias { dn, alias, .. } =>
@@ -167,5 +169,20 @@ mod tests {
     fn non_ascii_value_is_base64() {
         let line = attr_line("cn", "café".as_bytes());
         assert!(line.starts_with("cn:: "), "got {line:?}");
+    }
+
+    #[test]
+    fn rename_group_is_a_modrdn_record() {
+        let s = Schema::rfc2307();
+        let a = Action::RenameGroup {
+            dn: "cn=knights-errant,ou=groups,dc=lofar,dc=eu".into(),
+            new_cn: "knights".into(),
+            old_name: "knights-errant".into(),
+        };
+        let ldif = action_ldif(&a, "dc=lofar,dc=eu", &s);
+        assert_eq!(
+            ldif,
+            "dn: cn=knights-errant,ou=groups,dc=lofar,dc=eu\nchangetype: modrdn\nnewrdn: cn=knights\ndeleteoldrdn: 1\n"
+        );
     }
 }

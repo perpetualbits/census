@@ -52,6 +52,9 @@ pub enum Action {
     CreateGroup { name: String, gid_number: u32 },
     /// Delete a group entry by DN.
     DeleteGroup { dn: String, name: String },
+    /// Rename a group: change its `cn` RDN (an LDAP modrdn). `old_name` is kept so
+    /// the change is describable and reversible.
+    RenameGroup { dn: String, new_cn: String, old_name: String },
     /// Remove one non-RDN `cn` value (an alias) from a group entry.
     RemoveAlias { dn: String, alias: String, group: String },
     /// Add a `cn` value to a group entry (the inverse of [`Action::RemoveAlias`]).

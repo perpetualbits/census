@@ -14,17 +14,28 @@ use crate::tui::focus::Pane;
 use crate::tui::theme::*;
 
 /// Stable tile ids for the group screens.
-const GROUP_LIST: u64 = 1;
-const ALL_USERS:  u64 = 1;
-const MEMBERS:    u64 = 2;
+const GROUP_LIST:   u64 = 1;
+const GROUP_DETAIL: u64 = 2;
+const ALL_USERS:    u64 = 1;
+const MEMBERS:      u64 = 2;
 
+/// The group browse screen: group list (left) beside the per-group detail pane
+/// (right), mirroring the user browse screen. `Enter` on the list opens membership.
 pub fn render_select(app: &App, buf: &mut Buffer, area: Rect) {
-    if area.width < 12 || area.height < 5 { return; }
+    if area.width < 20 || area.height < 5 { return; }
+    let focus = app.group_browse_focus;
 
-    let mut tree = Node::Tile(GROUP_LIST);
-    let rects = render_shared(buf, &mut tree, area, &box_style(), &[]);
+    let mut tree = Node::Split {
+        orientation: Orientation::Horizontal,
+        children: vec![
+            (Constraint::new(Size::Percent(45)).with_min(24).with_max(56), Node::Tile(GROUP_LIST)),
+            (Constraint::new(Size::Fill(1)), Node::Tile(GROUP_DETAIL)),
+        ],
+    };
+    let focused = if focus == Pane::Left { GROUP_LIST } else { GROUP_DETAIL };
+    let rects = render_shared(buf, &mut tree, area, &box_style(), &[(focused, LineWeight::Heavy)]);
 
-    btxt(buf, area.x + 2, area.y, "  census — select group  ", s_title());
+    btxt(buf, area.x + 2, area.y, "  census — groups  ", s_title());
 
     // Duplicate summary on the top border, right-aligned, when collisions exist.
     let n_dup_gid  = app.groups().iter().filter(|g| g.dup_gid).count();
@@ -35,13 +46,36 @@ pub fn render_select(app: &App, buf: &mut Buffer, area: Rect) {
         btxt(buf, sx, area.y, &summary, s_warn());
     }
 
-    btxt(buf, area.x + 2, area.y + area.height - 1,
-         " jk  Enter:manage  n:new  D:del  a:del-alias  u:undo  L:ldif  ?:help  Esc ", s_dim());
+    let bottom = area.y + area.height - 1;
+    match &app.status {
+        Some((msg, is_err)) => {
+            btxt(buf, area.x + 2, bottom, &format!(" {msg} "),
+                 if *is_err { s_err() } else { s_ok() });
+        }
+        None => {
+            let hint = if focus == Pane::Right {
+                " Tab:list  jk:attr  e:edit  r:rename  a:del-alias  u:undo  L:ldif  ?:help  Esc "
+            } else {
+                " Tab:detail  jk  Enter:members  n:new  D:del  a:alias  u:undo  L:ldif  ?:help  Esc "
+            };
+            btxt(buf, area.x + 2, bottom, hint, s_dim());
+        }
+    }
 
-    let inner = rects[0].1;
+    for (id, r) in rects {
+        match id {
+            GROUP_LIST   => render_group_list(app, buf, r, focus == Pane::Left),
+            GROUP_DETAIL => super::group_detail::render(app, buf, r, focus == Pane::Right),
+            _ => {}
+        }
+    }
+}
+
+fn render_group_list(app: &App, buf: &mut Buffer, inner: Rect, focused: bool) {
     if inner.height < 3 { return; }
-
-    ColumnGrid::write_text(buf, inner, inner.y, "group", Align::Start, s_head());
+    let hs = if focused { s_head() } else { s_subhead() };
+    ColumnGrid::write_text(buf, inner, inner.y, &format!("groups ({})", app.groups().len()),
+                           Align::Start, hs);
     hline(buf, Rect::new(inner.x, inner.y + 1, inner.width, 1));
 
     let data = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(2));
@@ -53,7 +87,10 @@ pub fn render_select(app: &App, buf: &mut Buffer, area: Rect) {
         let y   = content.y + (i - cur.offset) as u16;
         let sel = i == cur.cursor;
         let dup = g.dup_name || g.dup_gid;
-        let sty = if sel { s_sel() } else if dup { s_warn() } else { s_normal() };
+        let sty = if sel { s_sel() }
+                  else if dup { s_warn() }
+                  else if focused { s_normal() }
+                  else { s_dim() };
         if sel { fill_row(buf, content.x, y, content.width, sty); }
 
         let gid = g.gid_number.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
@@ -62,7 +99,7 @@ pub fn render_select(app: &App, buf: &mut Buffer, area: Rect) {
         } else {
             format!("  aka {}", g.aliases.join(","))
         };
-        let label = format!("{}  gid {}{}  ({} members)", g.name, gid, alias, g.members.len());
+        let label = format!("{}  gid {}{}  ({})", g.name, gid, alias, g.members.len());
         ColumnGrid::write_text(buf, content, y, &label, Align::Start, sty);
 
         // Right-aligned collision marker, so duplicates are unmistakable.

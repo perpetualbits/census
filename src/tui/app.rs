@@ -38,6 +38,11 @@ pub struct App {
     detail: Option<User>,        // full record of the cursored user (lazy-loaded)
     detail_photo: Option<mullion::video::Frame>, // decoded jpegPhoto for `detail`
 
+    // Group browse screen (list + group detail), mirroring the user browse screen.
+    pub group_browse_focus: Pane,
+    pub group_detail_cur: usize,
+    pub group_detail_scroll: usize,
+
     selected_group: usize,
     pub active_pane: Pane,
     pub left_cur:  ListCursor,
@@ -68,6 +73,9 @@ impl App {
             detail_cur: 0,
             detail: None,
             detail_photo: None,
+            group_browse_focus: Pane::Left,
+            group_detail_cur: 0,
+            group_detail_scroll: 0,
             selected_group: 0,
             active_pane: Pane::Left,
             left_cur: ListCursor::new(),
@@ -253,9 +261,19 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind) {
                 };
             }
         },
-        Mode::GroupSelect => {
-            if down { app.groups_cur.down(app.groups().len()); } else { app.groups_cur.up(); }
-        }
+        Mode::GroupSelect => match app.group_browse_focus {
+            Pane::Left => {
+                if down { app.groups_cur.down(app.groups().len()); } else { app.groups_cur.up(); }
+                app.reset_group_detail();
+            }
+            Pane::Right => {
+                app.group_detail_scroll = if down {
+                    app.group_detail_scroll.saturating_add(1)
+                } else {
+                    app.group_detail_scroll.saturating_sub(1)
+                };
+            }
+        },
         Mode::Membership => match app.active_pane {
             Pane::Left  => if down { app.left_cur.down(app.users().len()); } else { app.left_cur.up() },
             Pane::Right => if down { app.right_cur.down(app.member_list().len()); } else { app.right_cur.up() },
@@ -300,6 +318,23 @@ fn update_offsets(app: &mut App, area: Rect) {
     // Clamp detail-pane scroll so it can't run off the end of the content.
     let max_scroll = screens::detail::row_count(app).saturating_sub(detail_vis);
     if app.detail_scroll > max_scroll { app.detail_scroll = max_scroll; }
+
+    // Group detail pane (no portrait band): keep the selected attribute in view and
+    // clamp its scroll, mirroring the user detail pane above.
+    let gdetail_vis = vis.saturating_sub(2).max(1);
+    if app.mode == Mode::GroupSelect && app.group_browse_focus == Pane::Right {
+        let ntargets = screens::group_detail::edit_targets(app).len();
+        if ntargets > 0 && app.group_detail_cur >= ntargets { app.group_detail_cur = ntargets - 1; }
+        if let Some(row) = screens::group_detail::target_row(app, app.group_detail_cur) {
+            if row < app.group_detail_scroll {
+                app.group_detail_scroll = row;
+            } else if row >= app.group_detail_scroll + gdetail_vis {
+                app.group_detail_scroll = row + 1 - gdetail_vis;
+            }
+        }
+    }
+    let g_max = screens::group_detail::row_count(app).saturating_sub(gdetail_vis);
+    if app.group_detail_scroll > g_max { app.group_detail_scroll = g_max; }
 }
 
 // ─── key handling ────────────────────────────────────────────────────────────
@@ -358,7 +393,12 @@ fn handle_key(
             // Esc steps focus back to the list, then quits.
             (Pane::Right, Esc) => app.browse_focus = Pane::Left,
             (Pane::Left,  Esc) => return Ok(true),
-            (_, Char('g')) => { app.mode = Mode::GroupSelect; app.groups_cur.reset(); }
+            (_, Char('g')) => {
+                app.mode = Mode::GroupSelect;
+                app.groups_cur.reset();
+                app.group_browse_focus = Pane::Left;
+                app.reset_group_detail();
+            }
             (_, Char('n')) => open_new_user(app),
             (_, Char('D')) => open_delete_user(app),
             (_, Tab) | (_, BackTab) => {
@@ -382,20 +422,38 @@ fn handle_key(
             _ => {}
         },
 
-        Mode::GroupSelect => match key {
-            Esc => { app.mode = Mode::Browse; }
-            Up   | Char('k') => app.groups_cur.up(),
-            Down | Char('j') => app.groups_cur.down(app.groups().len()),
-            Char('n') => open_new_group(app),
-            Char('D') => open_delete_group(app),
-            Char('a') => open_remove_alias(app),
-            Enter => {
+        Mode::GroupSelect => match (app.group_browse_focus, key) {
+            (_, Char('q')) => return Ok(true),
+            (Pane::Right, Esc) => app.group_browse_focus = Pane::Left,
+            (Pane::Left,  Esc) => app.mode = Mode::Browse,
+            (_, Tab) | (_, BackTab) => {
+                app.group_browse_focus =
+                    if app.group_browse_focus == Pane::Left { Pane::Right } else { Pane::Left };
+            }
+            // Actions valid from either pane (operate on the cursored group).
+            (_, Char('n')) => open_new_group(app),
+            (_, Char('D')) => open_delete_group(app),
+            (_, Char('a')) => open_remove_alias(app),
+            (_, Char('r')) => open_rename_group(app),
+            // Left pane: navigate the group list.
+            (Pane::Left, Up   | Char('k')) => { app.groups_cur.up();                     app.reset_group_detail(); }
+            (Pane::Left, Down | Char('j')) => { app.groups_cur.down(app.groups().len());  app.reset_group_detail(); }
+            (Pane::Left, PageUp)   => { app.groups_cur.page(-10, app.groups().len()); app.reset_group_detail(); }
+            (Pane::Left, PageDown) => { app.groups_cur.page(10, app.groups().len());  app.reset_group_detail(); }
+            (Pane::Left, Enter) => {
                 app.selected_group = app.groups_cur.cursor;
                 app.mode = Mode::Membership;
                 app.active_pane = Pane::Left;
                 app.left_cur.reset();
                 app.right_cur.reset();
             }
+            // Right pane: move the editable-attribute cursor / edit.
+            (Pane::Right, Up   | Char('k')) => { app.group_detail_cur = app.group_detail_cur.saturating_sub(1); }
+            (Pane::Right, Down | Char('j')) => {
+                let n = screens::group_detail::edit_targets(app).len();
+                if app.group_detail_cur + 1 < n { app.group_detail_cur += 1; }
+            }
+            (Pane::Right, Char('e')) => open_group_attr_edit(app),
             _ => {}
         },
 
@@ -536,6 +594,30 @@ fn open_delete_group(app: &mut App) {
     app.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::typed_dn(prompt, dn, action)));
 }
 
+/// Open the attribute editor for the group detail pane's selected target.
+fn open_group_attr_edit(app: &mut App) {
+    if !app.can_write_ui() {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let targets = screens::group_detail::edit_targets(app);
+    let Some(target) = targets.get(app.group_detail_cur) else { return; };
+    let Some(group) = app.groups().get(app.groups_cur.cursor) else { return; };
+    let dlg = overlay::InputDialog::edit_attr(group.dn.clone(), target.attr.clone(), &target.value);
+    app.overlay = Some(Overlay::Input(dlg));
+}
+
+/// Open the rename dialog (cn/RDN via modrdn) for the cursored group.
+fn open_rename_group(app: &mut App) {
+    if !app.can_write_ui() {
+        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        return;
+    }
+    let Some(group) = app.groups().get(app.groups_cur.cursor) else { return; };
+    let dlg = overlay::InputDialog::rename_group(group.dn.clone(), &group.name);
+    app.overlay = Some(Overlay::Input(dlg));
+}
+
 /// Open a confirmation to remove the cursored group's first alias `cn` (an extra,
 /// non-RDN name). Undoable. Repeat to strip multiple aliases.
 fn open_remove_alias(app: &mut App) {
@@ -585,6 +667,8 @@ fn describe_action(action: &Action) -> String {
             format!("ADD group cn={name} (gidNumber={gid_number})"),
         Action::DeleteGroup { dn, .. } =>
             format!("DELETE {dn}"),
+        Action::RenameGroup { dn, new_cn, .. } =>
+            format!("RENAME {dn} → cn={new_cn}"),
         Action::RemoveAlias { dn, alias, .. } =>
             format!("DELETE cn={alias} on {dn}"),
         Action::AddAlias { dn, alias, .. } =>
@@ -656,6 +740,8 @@ fn apply(app: &mut App, action: &Action) -> anyhow::Result<bool> {
             match app.session_mut().client.modify_replace(dn, attr, &refs) {
                 Ok(()) => {
                     app.reload_detail_record();
+                    // The edited entry may be a group (group detail reads the cache).
+                    let _ = app.session_mut().refresh_groups();
                     let msg = if refs.is_empty() { format!("Cleared {attr}") } else { format!("Set {attr}") };
                     app.status = Some((msg, false));
                     true
@@ -710,6 +796,12 @@ fn apply(app: &mut App, action: &Action) -> anyhow::Result<bool> {
         Action::DeleteGroup { dn, name } => {
             match app.session_mut().client.delete_entry(dn) {
                 Ok(()) => { app.session_mut().refresh_groups()?; app.groups_cur.clamp(app.groups().len()); app.status = Some((format!("Deleted group {name}"), false)); true }
+                Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
+            }
+        }
+        Action::RenameGroup { dn, new_cn, old_name } => {
+            match app.session_mut().client.rename_entry(dn, new_cn) {
+                Ok(new_dn) => { app.session_mut().refresh_groups()?; app.select_group_by_dn(&new_dn); app.status = Some((format!("Renamed {old_name} → {new_cn}"), false)); true }
                 Err(e) => { app.status = Some((format!("Error: {e}"), true)); false }
             }
         }
@@ -790,6 +882,16 @@ fn inverse_of(app: &mut App, action: &Action) -> Option<(String, Action)> {
             let attrs = app.session_mut().client.read_entry_raw(dn).ok()?;
             Some((format!("delete group {name}"), Action::RestoreEntry { dn: dn.clone(), attrs, label: name.clone() }))
         }
+        Action::RenameGroup { dn, new_cn, old_name } => {
+            // After the rename the entry lives at cn=<new_cn>,<tail>; the inverse
+            // renames that back to the old name.
+            let tail = dn.split_once(',').map(|(_, r)| r).unwrap_or("");
+            let new_dn = if tail.is_empty() { format!("cn={new_cn}") } else { format!("cn={new_cn},{tail}") };
+            Some((
+                format!("rename {old_name} → {new_cn}"),
+                Action::RenameGroup { dn: new_dn, new_cn: old_name.clone(), old_name: new_cn.clone() },
+            ))
+        }
         Action::RemoveAlias { dn, alias, group } => Some((
             format!("remove alias {alias} from {group}"),
             Action::AddAlias { dn: dn.clone(), alias: alias.clone(), group: group.clone() },
@@ -864,6 +966,12 @@ impl App {
         if let Some(i) = self.groups().iter().position(|g| g.dn == dn) {
             self.groups_cur.cursor = i;
         }
+    }
+
+    /// Reset the group detail pane's cursor/scroll (on a group-list navigation).
+    fn reset_group_detail(&mut self) {
+        self.group_detail_cur = 0;
+        self.group_detail_scroll = 0;
     }
 }
 

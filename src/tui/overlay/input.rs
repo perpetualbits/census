@@ -11,6 +11,8 @@ use super::{modal_frame, Action, OverlayResult};
 enum Target {
     /// Replace a single attribute's value on `dn`.
     Attr { dn: String, attr: String },
+    /// Rename a group: change its `cn` RDN to the typed value.
+    Rename { dn: String, old_name: String },
 }
 
 /// A one-line text editor rendered as a centred modal box. The text buffer and
@@ -40,6 +42,19 @@ impl InputDialog {
         }
     }
 
+    /// Rename group `current_name` (DN `dn`) — the typed value becomes its new `cn` RDN.
+    pub fn rename_group(dn: impl Into<String>, current_name: &str) -> Self {
+        let value = current_name.to_string();
+        Self {
+            title: "rename group (cn / RDN)".into(),
+            label: "cn".into(),
+            cursor: value.len(),
+            target: Target::Rename { dn: dn.into(), old_name: value.clone() },
+            value,
+            masked: false,
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyCode, _mods: KeyModifiers) -> OverlayResult {
         use KeyCode::*;
         match key {
@@ -53,6 +68,18 @@ impl InputDialog {
                         // An empty edit clears the attribute.
                         values: if value.is_empty() { vec![] } else { vec![value] },
                     }),
+                    Target::Rename { dn, old_name } => {
+                        // An empty or unchanged name is a no-op, not a rename.
+                        if value.is_empty() || &value == old_name {
+                            OverlayResult::Cancel
+                        } else {
+                            OverlayResult::Commit(Action::RenameGroup {
+                                dn: dn.clone(),
+                                new_cn: value,
+                                old_name: old_name.clone(),
+                            })
+                        }
+                    }
                 }
             }
             // Everything else is grapheme-aware line editing.
