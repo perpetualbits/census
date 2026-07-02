@@ -6,6 +6,7 @@
 //! sources at once (and migrate between them) without reworking call sites.
 
 use crate::config::Config;
+use crate::conninfo::{ConnInfo, PwSource};
 use crate::ldap::client::{Group, LdapClient, User};
 
 pub struct Session {
@@ -15,15 +16,22 @@ pub struct Session {
     pub client: LdapClient,
     pub users: Vec<User>,
     pub groups: Vec<Group>,
+    /// How this session reached the directory + got its password (for the UI gap).
+    pub conn: ConnInfo,
 }
 
 impl Session {
     /// Connect, bind, and load the initial user/group caches.
-    pub fn connect(cfg: &Config, password: Option<&str>, label: String) -> anyhow::Result<Self> {
+    pub fn connect(cfg: &Config, password: Option<&str>, pw_source: PwSource, label: String)
+        -> anyhow::Result<Self>
+    {
         let mut client = LdapClient::connect(cfg, password)?;
+        let tls = if cfg.server.use_ssl { "LDAPS" }
+                  else if cfg.server.start_tls { "STARTTLS" } else { "LDAP" };
+        let conn = ConnInfo { via: client.conn_via().clone(), tls, password: pw_source };
         let users = client.list_users()?;
         let groups = client.list_groups()?;
-        Ok(Self { label, client, users, groups })
+        Ok(Self { label, client, users, groups, conn })
     }
 
     /// Re-read the user list from the directory.

@@ -1,4 +1,5 @@
 mod config;
+mod conninfo;
 mod ldap;
 mod schema;
 mod session;
@@ -40,13 +41,13 @@ fn main() -> anyhow::Result<()> {
 
     let allow_writes = args.write || cfg.display.allow_writes;
 
-    let password = get_password(&cfg);
+    let (password, pw_source) = get_password(&cfg);
 
     if args.ping {
         return cmd_ping(&cfg, password.as_deref(), allow_writes);
     }
 
-    let session = Session::connect(&cfg, password.as_deref(), "(default)".into())?;
+    let session = Session::connect(&cfg, password.as_deref(), pw_source, "(default)".into())?;
     tui::run(vec![session], allow_writes, args.dry_run)
 }
 
@@ -75,22 +76,30 @@ fn cmd_ping(cfg: &Config, password: Option<&str>, allow_writes: bool) -> anyhow:
     Ok(())
 }
 
-fn get_password(cfg: &Config) -> Option<String> {
+fn get_password(cfg: &Config) -> (Option<String>, conninfo::PwSource) {
+    use conninfo::PwSource;
     // No bind DN → anonymous bind, no password needed.
-    cfg.server.bind_dn.as_ref()?;
+    if cfg.server.bind_dn.is_none() {
+        return (None, PwSource::Anonymous);
+    }
     // 1. password_cmd in config (e.g. rbw get "...")
     if let Some(cmd) = &cfg.server.password_cmd {
         match run_password_cmd(cmd) {
-            Ok(pw) => return Some(pw),
+            Ok(pw) => return (Some(pw), PwSource::Cmd(cmd_label(cmd))),
             Err(e) => eprintln!("Warning: password_cmd failed: {e}"),
         }
     }
     // 2. Environment variable
     if let Ok(pw) = std::env::var("CENSUS_BIND_PASSWORD") {
-        return Some(pw);
+        return (Some(pw), PwSource::Env);
     }
     // 3. Interactive prompt
-    rpassword::prompt_password("LDAP bind password: ").ok()
+    (rpassword::prompt_password("LDAP bind password: ").ok(), PwSource::Prompt)
+}
+
+/// The program name of a `password_cmd` (e.g. `rbw get '…'` → `rbw`), for display.
+fn cmd_label(cmd: &str) -> String {
+    cmd.split_whitespace().next().unwrap_or("cmd").to_string()
 }
 
 fn run_password_cmd(cmd: &str) -> anyhow::Result<String> {

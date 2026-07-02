@@ -7,7 +7,7 @@
 //! so the glyphs (and the title text in the top border) are preserved, the glow just
 //! slides over them.
 
-use mullion::{ease::gaussian, render_rim, style::Color, Buffer, Rect};
+use mullion::{ease::gaussian, render_rim, style::Color, BorderGap, Buffer, Rect};
 
 /// Glow colour (warm yellow).
 const GLOW: (f32, f32, f32) = (255.0, 210.0, 40.0);
@@ -18,8 +18,10 @@ const LOOP_SECS: f32 = 6.0;
 /// Skip cells dimmer than this to avoid touching the whole border.
 const CUTOFF: f32 = 0.06;
 
-/// Draw the travelling glow over `area`'s border. `t` is elapsed seconds.
-pub fn edge_glow(buf: &mut Buffer, area: Rect, t: f32) {
+/// Draw the travelling glow over `area`'s border. `t` is elapsed seconds. Cells
+/// inside any of `gaps` (e.g. the connection info gap) are left untouched so their
+/// own colours show through.
+pub fn edge_glow(buf: &mut Buffer, area: Rect, t: f32, gaps: &[BorderGap]) {
     if area.width < 4 || area.height < 4 {
         return;
     }
@@ -31,7 +33,7 @@ pub fn edge_glow(buf: &mut Buffer, area: Rect, t: f32) {
     // Hotspot position as a fraction of the perimeter, advancing clockwise.
     let head = (t / LOOP_SECS).rem_euclid(1.0);
 
-    render_rim(buf, area, &[], |pos, cur| {
+    render_rim(buf, area, gaps, |pos, cur| {
         // Shortest wrap-around arc to the hotspot, then back to cell units so SIGMA
         // keeps its "width in cells" meaning.
         let mut d = (pos - head).abs();
