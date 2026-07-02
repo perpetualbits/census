@@ -52,6 +52,10 @@ pub enum Action {
     CreateGroup { name: String, gid_number: u32 },
     /// Delete a group entry by DN.
     DeleteGroup { dn: String, name: String },
+    /// Re-create a previously-captured entry verbatim — the inverse of a delete,
+    /// used by the undo stack. Values are raw bytes so binary attributes (e.g.
+    /// `jpegPhoto`) round-trip. Never produced by an overlay; only by rollback.
+    RestoreEntry { dn: String, attrs: Vec<(String, Vec<Vec<u8>>)>, label: String },
 }
 
 /// What a modal asks the app to do after a keystroke.
