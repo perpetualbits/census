@@ -18,18 +18,28 @@ pub const VLV_OID: &str = "2.16.840.1.113730.3.4.9";
 /// Simple Paged Results control OID (RFC 2696) — advertised by nearly every server.
 pub const PAGED_OID: &str = "1.2.840.113556.1.4.319";
 
-/// A Server-Side Sort request sorting by a single attribute, ascending or
-/// descending. The `orderingRule` is omitted so the server uses the attribute's
-/// own ordering matching rule (correct for `uid`/`cn`). Sent non-critical — census
-/// only uses it when capability detection has confirmed the server supports it.
+/// `caseIgnoreOrderingMatch` — the ordering rule census names for string sort keys.
+pub const CASE_IGNORE_ORDERING: &str = "2.5.13.3";
+
+/// A Server-Side Sort request sorting by a single string attribute, ascending or
+/// descending. The `orderingRule` is set **explicitly** to `caseIgnoreOrderingMatch`:
+/// OpenLDAP refuses to sort by an attribute (like `uid`) whose schema declares no
+/// ORDERING ("serverSort control: No ordering rule") unless one is named, and naming
+/// it is harmless on servers (e.g. 389-ds) that would otherwise default it. Sent
+/// non-critical — census only uses it once capability detection confirms SSS support.
 ///
 /// `SortKeyList ::= SEQUENCE OF SEQUENCE { attributeType OCTET STRING,
 ///     orderingRule [0] OCTET STRING OPTIONAL, reverseOrder [1] BOOLEAN DEFAULT FALSE }`
 pub fn sort_control(attr: &str, reverse: bool) -> RawControl {
-    let mut key = vec![Tag::OctetString(OctetString {
-        inner: attr.as_bytes().to_vec(),
-        ..Default::default()
-    })];
+    let mut key = vec![
+        Tag::OctetString(OctetString { inner: attr.as_bytes().to_vec(), ..Default::default() }),
+        // orderingRule [0] OCTET STRING — required by OpenLDAP for uid/cn.
+        Tag::OctetString(OctetString {
+            id: 0,
+            class: TagClass::Context,
+            inner: CASE_IGNORE_ORDERING.as_bytes().to_vec(),
+        }),
+    ];
     if reverse {
         // reverseOrder [1] BOOLEAN — context-tagged, only emitted when true (DEFAULT FALSE).
         key.push(Tag::Boolean(Boolean { id: 1, class: TagClass::Context, inner: true }));
@@ -50,26 +60,31 @@ mod tests {
 
     #[test]
     fn ascending_uid_is_byte_exact() {
-        // SEQUENCE { SEQUENCE { OCTETSTRING "uid" } }
+        // SEQUENCE { SEQUENCE { OCTETSTRING "uid", [0] OCTETSTRING "2.5.13.3" } }
         let c = sort_control("uid", false);
         assert_eq!(c.ctype, SSS_OID);
         assert!(!c.crit);
         assert_eq!(
             c.val.unwrap(),
-            vec![0x30, 0x07, 0x30, 0x05, 0x04, 0x03, b'u', b'i', b'd']
+            vec![
+                0x30, 0x11, 0x30, 0x0f, 0x04, 0x03, b'u', b'i', b'd',
+                0x80, 0x08, 0x32, 0x2e, 0x35, 0x2e, 0x31, 0x33, 0x2e, 0x33, // [0] "2.5.13.3"
+            ]
         );
     }
 
     #[test]
     fn descending_uid_appends_reverse_boolean() {
-        // SEQUENCE { SEQUENCE { OCTETSTRING "uid", [1] BOOLEAN true } }
+        // … same, plus [1] BOOLEAN true at the end.
         let val = sort_control("uid", true).val.unwrap();
-        // Structure up to the boolean value is fixed; the last (boolean) byte is
-        // non-zero (BER TRUE — 0x01 or 0xFF depending on the encoder).
         assert_eq!(
-            &val[..11],
-            &[0x30, 0x0a, 0x30, 0x08, 0x04, 0x03, b'u', b'i', b'd', 0x81, 0x01]
+            &val[..21],
+            &[
+                0x30, 0x14, 0x30, 0x12, 0x04, 0x03, b'u', b'i', b'd',
+                0x80, 0x08, 0x32, 0x2e, 0x35, 0x2e, 0x31, 0x33, 0x2e, 0x33,
+                0x81, 0x01, // [1] BOOLEAN, len 1
+            ]
         );
-        assert_ne!(val[11], 0x00);
+        assert_ne!(val[21], 0x00); // BER TRUE (0x01 or 0xFF)
     }
 }
