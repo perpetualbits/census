@@ -70,6 +70,12 @@ impl TextAreaDialog {
         }
     }
 
+    /// A paste drops in verbatim, newlines preserved (this is the multi-line editor).
+    pub fn handle_paste(&mut self, text: &str) -> OverlayResult {
+        super::paste_into(&mut self.value, &mut self.cursor, text, true);
+        OverlayResult::Stay
+    }
+
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         let w = area.width.saturating_sub(6).clamp(30, 90);
         let h = area.height.saturating_sub(4).clamp(8, 30);

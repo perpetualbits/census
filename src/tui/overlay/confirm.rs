@@ -59,6 +59,14 @@ impl ConfirmDialog {
         }
     }
 
+    /// Only the typed-DN variant has a text field; pasting the DN is a convenience.
+    pub fn handle_paste(&mut self, text: &str) -> OverlayResult {
+        if matches!(self.kind, ConfirmKind::TypedDn { .. }) {
+            super::paste_into(&mut self.typed, &mut self.cursor, text, false);
+        }
+        OverlayResult::Stay
+    }
+
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         let w = area.width.saturating_sub(8).clamp(24, 80);
         let h = match self.kind { ConfirmKind::YesNo => 5, ConfirmKind::TypedDn { .. } => 7 };

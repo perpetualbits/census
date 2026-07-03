@@ -108,6 +108,12 @@ impl InputDialog {
         }
     }
 
+    /// A pasted value drops into the single-line field verbatim (newlines stripped).
+    pub fn handle_paste(&mut self, text: &str) -> OverlayResult {
+        super::paste_into(&mut self.value, &mut self.cursor, text, false);
+        OverlayResult::Stay
+    }
+
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         let w = area.width.saturating_sub(8).clamp(20, 72);
         let rect = modal_frame(buf, area, w, 6);

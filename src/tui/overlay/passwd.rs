@@ -60,6 +60,13 @@ impl PasswdDialog {
         }
     }
 
+    /// Paste into the focused password field (newlines stripped).
+    pub fn handle_paste(&mut self, text: &str) -> OverlayResult {
+        let (t, c) = self.cur();
+        super::paste_into(t, c, text, false);
+        OverlayResult::Stay
+    }
+
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         let w = area.width.saturating_sub(8).clamp(28, 60);
         let rect = modal_frame(buf, area, w, 8);

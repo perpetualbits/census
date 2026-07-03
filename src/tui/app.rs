@@ -422,10 +422,32 @@ fn main_loop(
 /// Route one captured event to the key/mouse handlers; returns `true` to quit.
 fn dispatch(app: &mut App, ev: Event) -> anyhow::Result<bool> {
     match ev {
-        Event::Key(key)  => handle_key(app, key.code, key.modifiers),
-        Event::Mouse(me) => { handle_mouse(app, me.kind); Ok(false) }
+        Event::Key(key)   => handle_key(app, key.code, key.modifiers),
+        Event::Mouse(me)  => { handle_mouse(app, me.kind); Ok(false) }
+        Event::Paste(text) => handle_paste(app, text),
         _ => Ok(false),
     }
+}
+
+/// A bracketed paste (one atomic block) is delivered to the active text field —
+/// never re-interpreted as command keystrokes. With no overlay, it feeds the search
+/// query while searching, and is otherwise ignored.
+fn handle_paste(app: &mut App, text: String) -> anyhow::Result<bool> {
+    if let Some(ov) = &mut app.overlay {
+        match ov.handle_paste(&text) {
+            OverlayResult::Stay   => {}
+            OverlayResult::Cancel => app.overlay = None,
+            OverlayResult::Commit(action) => {
+                app.overlay = None;
+                perform(app, action)?;
+            }
+        }
+        return Ok(false);
+    }
+    if app.mode == Mode::Search {
+        app.paste_search(&text);
+    }
+    Ok(false)
 }
 
 /// Mouse handling: the wheel scrolls the active list/pane, mirroring `j`/`k`.
@@ -1327,6 +1349,12 @@ impl App {
         let hits = search_hits(self.users(), self.groups(), &self.search_query);
         self.search_hits = hits;
         self.search_cur.reset();
+    }
+
+    /// Feed a bracketed paste into the query field (single line) and refresh matches.
+    pub fn paste_search(&mut self, text: &str) {
+        overlay::paste_into(&mut self.search_query, &mut self.search_caret, text, false);
+        self.recompute_search();
     }
 
     pub fn search_query(&self) -> &str { &self.search_query }

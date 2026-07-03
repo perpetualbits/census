@@ -103,6 +103,21 @@ impl Overlay {
         }
     }
 
+    /// Deliver a bracketed paste to the active field. Overlays without a text field
+    /// ignore it (returning `Stay`), so a paste is never interpreted as commands.
+    pub fn handle_paste(&mut self, text: &str) -> OverlayResult {
+        match self {
+            Overlay::Input(d)    => d.handle_paste(text),
+            Overlay::Keys(d)     => d.handle_paste(text),
+            Overlay::Confirm(d)  => d.handle_paste(text),
+            Overlay::Passwd(d)   => d.handle_paste(text),
+            Overlay::NewUser(d)  => d.handle_paste(text),
+            Overlay::NewGroup(d) => d.handle_paste(text),
+            Overlay::TextArea(d) => d.handle_paste(text),
+            Overlay::Help(_)     => OverlayResult::Stay,
+        }
+    }
+
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         match self {
             Overlay::Input(d)    => d.render(buf, area),
@@ -115,6 +130,20 @@ impl Overlay {
             Overlay::Help(d)     => d.render(buf, area),
         }
     }
+}
+
+/// Insert pasted `text` into a caller-owned field at byte offset `*cursor`, advancing
+/// it. Control characters are dropped (newlines too, unless `multiline`) — this is what
+/// makes a paste land as *data* rather than as a stream of command keystrokes.
+pub fn paste_into(value: &mut String, cursor: &mut usize, text: &str, multiline: bool) {
+    let clean: String = text
+        .chars()
+        .filter(|&c| (multiline && c == '\n') || !c.is_control())
+        .collect();
+    if clean.is_empty() { return; }
+    let at = (*cursor).min(value.len());
+    value.insert_str(at, &clean);
+    *cursor = at + clean.len();
 }
 
 /// Census-styled modal chrome: centre a `w`×`h` box, clear its interior and draw the

@@ -76,6 +76,29 @@ impl KeyEditor {
         }
     }
 
+    /// A bracketed paste is how a (long) key actually gets in. If an add-line is open,
+    /// the paste fills it (whitespace collapsed to one line — an OpenSSH key is one
+    /// line). Otherwise each pasted non-empty line is appended as its own key, so a
+    /// single key or a whole `authorized_keys` block both work — and, crucially, the
+    /// pasted text never runs as `a`/`d`/`s` commands.
+    pub fn handle_paste(&mut self, text: &str) -> OverlayResult {
+        if let Some((buf, cur)) = &mut self.adding {
+            let clean = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let at = (*cur).min(buf.len());
+            buf.insert_str(at, &clean);
+            *cur = at + clean.len();
+        } else {
+            for line in text.lines() {
+                let line = line.trim();
+                if !line.is_empty() {
+                    self.keys.push(line.to_string());
+                    self.cursor = self.keys.len() - 1;
+                }
+            }
+        }
+        OverlayResult::Stay
+    }
+
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         // The pending change, as a diff of summarised key sets (added +, removed -).
         let orig: Vec<String> = self.original.iter().map(|k| summarize(k)).collect();

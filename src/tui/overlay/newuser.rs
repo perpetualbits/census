@@ -117,6 +117,13 @@ impl NewUserForm {
         }
     }
 
+    /// Paste into the focused field (newlines stripped).
+    pub fn handle_paste(&mut self, text: &str) -> OverlayResult {
+        let f = &mut self.fields[self.cursor];
+        super::paste_into(&mut f.value, &mut f.cursor, text, false);
+        OverlayResult::Stay
+    }
+
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         let w = area.width.saturating_sub(8).clamp(34, 60);
         let h = (self.fields.len() as u16 + 4).min(area.height.saturating_sub(2));
