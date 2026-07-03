@@ -263,8 +263,9 @@ fn run(client: &mut LdapClient, ctx: &mut Ctx, cmd: Command, write: bool) -> Res
     match cmd {
         Command::Ping => ping(client, write),
         Command::Search { query, json } => {
-            let (users, _) = client.list_users()?;
-            let (groups, _) = client.list_groups()?;
+            // Server-side filter (scales), then rank the bounded result set.
+            let users = client.search_users(&query, 200)?;
+            let groups = client.search_groups(&query, 200)?;
             output::hits(&search_hits(&users, &groups, &query), json);
             Ok(())
         }

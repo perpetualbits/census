@@ -2,13 +2,13 @@
 
 use mullion::{
     label::Align,
-    render_shared,
+    render_scrollbar, render_shared,
     table::{ColumnDef, ColumnGrid, ColumnKind},
     Buffer, Constraint, LineWeight, Node, Orientation, Rect, Size,
 };
 
 use crate::tui::app::App;
-use crate::tui::draw::{btxt, fill_row, hline, keyhints, vscroll};
+use crate::tui::draw::{btxt, fill_row, hline, keyhints};
 use crate::tui::focus::Pane;
 use crate::tui::theme::*;
 
@@ -53,12 +53,7 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focus: Pane) {
                 &[("Tab", "pane"), ("jk", "users"), ("/", "search"), ("n", "new"), ("D", "del"),
                   ("g", "groups"), ("t", "tree"), ("u", "undo"), ("?", "help"), ("q", "quit")]
             };
-            let count = format!(" {} users ", app.users().len());
-            let cw = count.chars().count() as u16;
-            let hint_w = area.width.saturating_sub(4).saturating_sub(cw);
-            keyhints(buf, area.x + 2, bottom, hint_w, pairs);
-            let cx = area.x + area.width.saturating_sub(1 + cw);
-            btxt(buf, cx, bottom, &count, s_dim());
+            keyhints(buf, area.x + 2, bottom, area.width.saturating_sub(4), pairs);
         }
     }
 
@@ -72,24 +67,30 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focus: Pane) {
 }
 
 fn render_list(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
-    let hs    = if focused { s_head() } else { s_subhead() };
-    let label = if app.users_truncated() {
-        format!("users ({} — capped)", app.users().len())
-    } else {
-        format!("users ({})", app.users().len())
-    };
+    let hs   = if focused { s_head() } else { s_subhead() };
+    let list = app.user_list();
+    // The list is windowed over the directory — the total is unknown, so show the
+    // window ("N shown", `+` when more exist below), not a (misleading) count.
+    let more = if list.at_top() && list.at_bottom() { "" } else { "+" };
+    let mut label = format!("users ({}{more} shown)", list.visible().len());
+    if app.browse_err() { label.push_str(" — browse error"); }
     ColumnGrid::write_text(buf, area, area.y, &label, Align::Start, hs);
     hline(buf, Rect::new(area.x, area.y + 1, area.width, 1));
 
     let data = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(2));
-    let vis  = data.height as usize;
-    let cur  = &app.users_cur;
-    let content = vscroll(buf, data, cur.offset, app.users().len(), vis);
+    // Estimated scrollbar in the rightmost column unless the whole set is on screen.
+    let content = if !(list.at_top() && list.at_bottom()) && data.width >= 2 {
+        let bar = Rect::new(data.x + data.width - 1, data.y, 1, data.height);
+        render_scrollbar(buf, bar, app.user_metrics(), s_dim());
+        Rect::new(data.x, data.y, data.width - 1, data.height)
+    } else {
+        data
+    };
     let cols = list_grid().resolve(content);
 
-    for (i, user) in app.users().iter().enumerate().skip(cur.offset).take(vis) {
-        let y   = content.y + (i - cur.offset) as u16;
-        let sel = i == cur.cursor;
+    for (row, user) in list.visible().iter().enumerate() {
+        let y   = content.y + row as u16;
+        let sel = list.selected_visible_row() == Some(row);
         let sty = if sel { s_sel() } else if focused { s_normal() } else { s_dim() };
         if sel { fill_row(buf, content.x, y, content.width, sty); }
         ColumnGrid::write_text(buf, cols[0], y, &user.uid, Align::Start, sty);

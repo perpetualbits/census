@@ -1,0 +1,203 @@
+//! LDAP-backed [`mullion::RecordSource`]s that let census window huge lists through
+//! a [`mullion::VirtualList`] instead of loading everything.
+//!
+//! The source holds a **shared browse connection** (`Rc<RefCell<LdapClient>>`,
+//! separate from the write/detail client so its borrows never overlap). When the
+//! server supports **Server-Side Sort**, each fetch is an independent keyset search
+//! (`LdapClient::page_users`) — no server cursor state, constant memory, scales to
+//! millions, with an *estimated* scrollbar. Without SSS, ordering can't be pushed to
+//! the server, so it degrades to a **client-sorted cache** loaded once (bounded by
+//! the size cap): correct and exact-scrollbar, but not unbounded.
+//!
+//! Errors are swallowed to an empty window (the trait can't return `Result`); the
+//! last error is flagged for the screen to surface.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use mullion::{RecordSource, Window};
+
+use super::client::{LdapClient, User};
+
+/// Shared handle to the read-only browse connection.
+pub type Browse = Rc<RefCell<LdapClient>>;
+
+/// A windowed source of users, sorted by `uid`.
+pub struct UserSource {
+    client: Browse,
+    /// Set when a fetch failed, so the screen can surface a "browse error" note.
+    err: Rc<Cell<bool>>,
+    /// Whether the server can sort server-side (keyset mode); else the cache mode.
+    sss: bool,
+    /// Client-sorted snapshot used only in the no-SSS fallback (loaded once, capped).
+    cache: Option<Vec<User>>,
+}
+
+impl UserSource {
+    pub fn new(client: Browse, err: Rc<Cell<bool>>, sss: bool) -> Self {
+        Self { client, err, sss, cache: None }
+    }
+
+    /// One server keyset page (SSS mode), swallowing errors to an empty, boundary
+    /// window.
+    fn page(&mut self, after: Option<&str>, before: Option<&str>, limit: i32) -> (Vec<User>, bool) {
+        match self.client.borrow_mut().page_users(after, before, limit) {
+            Ok(pair) => pair,
+            Err(_) => {
+                self.err.set(true);
+                (Vec::new(), true)
+            }
+        }
+    }
+
+    /// The client-sorted snapshot (no-SSS fallback), loaded once (bounded by the cap).
+    fn cache(&mut self) -> &[User] {
+        if self.cache.is_none() {
+            let users = match self.client.borrow_mut().list_users() {
+                Ok((u, _)) => u,
+                Err(_) => {
+                    self.err.set(true);
+                    Vec::new()
+                }
+            };
+            self.cache = Some(users);
+        }
+        self.cache.as_deref().unwrap_or(&[])
+    }
+}
+
+impl RecordSource for UserSource {
+    type Key = String;
+    type Row = User;
+
+    fn key_of(&self, row: &User) -> String {
+        row.uid.clone()
+    }
+
+    fn fetch_after(&mut self, key: Option<String>, n: usize) -> Window<User> {
+        if self.sss {
+            // Range `uid >= key` includes the anchor; request one extra and drop it
+            // to honour the strict-after contract.
+            let (users, boundary) = self.page(key.as_deref(), None, n as i32 + 1);
+            Window::new(assemble(users, key.as_deref(), n, false, |u| &u.uid), boundary)
+        } else {
+            let users = self.cache();
+            let start = match &key {
+                None => 0,
+                Some(k) => users.partition_point(|u| &u.uid <= k),
+            };
+            let end = (start + n).min(users.len());
+            Window::new(users[start..end].to_vec(), end == users.len())
+        }
+    }
+
+    fn fetch_before(&mut self, key: Option<String>, n: usize) -> Window<User> {
+        if self.sss {
+            let (users, boundary) = self.page(None, key.as_deref(), n as i32 + 1);
+            Window::new(assemble(users, key.as_deref(), n, true, |u| &u.uid), boundary)
+        } else {
+            let users = self.cache();
+            let end = match &key {
+                None => users.len(),
+                Some(k) => users.partition_point(|u| &u.uid < k),
+            };
+            let start = end.saturating_sub(n);
+            Window::new(users[start..end].to_vec(), start == 0)
+        }
+    }
+
+    fn approx_position(&mut self, key: &String) -> Option<f32> {
+        if self.sss {
+            Some(lexical_fraction(key)) // unknown length → estimate
+        } else {
+            let users = self.cache();
+            if users.is_empty() {
+                None
+            } else {
+                Some(users.partition_point(|u| &u.uid < key) as f32 / users.len() as f32)
+            }
+        }
+    }
+
+    fn exact_len(&mut self) -> Option<u64> {
+        if self.sss {
+            None // an LDAP cursor can't count cheaply → honest estimated scrollbar
+        } else {
+            Some(self.cache().len() as u64) // cache mode knows its length → exact
+        }
+    }
+}
+
+/// Turn a server keyset page (ascending) into a strict window: drop the anchor row
+/// (the range filter is inclusive), then keep `n` rows — the first `n` for a forward
+/// (`after`) fetch, the last `n` (closest to the anchor) for a `before` fetch.
+fn assemble<T>(mut rows: Vec<T>, anchor: Option<&str>, n: usize, before: bool, key: impl Fn(&T) -> &str) -> Vec<T> {
+    if let Some(k) = anchor {
+        rows.retain(|r| key(r) != k);
+    }
+    if before {
+        if rows.len() > n {
+            rows.drain(0..rows.len() - n);
+        }
+    } else {
+        rows.truncate(n);
+    }
+    rows
+}
+
+/// A rough `[0,1)` position of `key` in printable-ASCII lexical order (base-95 over
+/// the first three bytes) — enough to drive an *estimated* scrollbar thumb over a
+/// set whose length is unknown. Monotonic in the key.
+fn lexical_fraction(key: &str) -> f32 {
+    let mut f = 0.0f32;
+    let mut scale = 1.0f32;
+    for b in key.bytes().take(3) {
+        scale /= 95.0;
+        f += (b.saturating_sub(32).min(94) as f32) * scale;
+    }
+    f.clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{assemble, lexical_fraction};
+
+    fn ks(s: &[&str]) -> Vec<String> { s.iter().map(|x| x.to_string()).collect() }
+    fn key(s: &String) -> &str { s.as_str() }
+
+    #[test]
+    fn assemble_after_drops_anchor_and_truncates() {
+        // server returned uid>=c (inclusive), ascending: c,d,e,f — want 2 strict-after.
+        let w = assemble(ks(&["c", "d", "e", "f"]), Some("c"), 2, false, key);
+        assert_eq!(w, ks(&["d", "e"]));
+    }
+
+    #[test]
+    fn assemble_after_from_start_keeps_first_n() {
+        let w = assemble(ks(&["a", "b", "c"]), None, 2, false, key);
+        assert_eq!(w, ks(&["a", "b"]));
+    }
+
+    #[test]
+    fn assemble_before_drops_anchor_and_keeps_closest_n() {
+        // server returned uid<=f (inclusive), ascending: c,d,e,f — want 2 before f.
+        let w = assemble(ks(&["c", "d", "e", "f"]), Some("f"), 2, true, key);
+        assert_eq!(w, ks(&["d", "e"]));
+    }
+
+    #[test]
+    fn assemble_no_anchor_before_keeps_last_n() {
+        let w = assemble(ks(&["x", "y", "z"]), None, 2, true, key);
+        assert_eq!(w, ks(&["y", "z"]));
+    }
+
+    #[test]
+    fn lexical_fraction_is_monotonic_and_bounded() {
+        assert!(lexical_fraction("aaa") < lexical_fraction("abc"));
+        assert!(lexical_fraction("abc") < lexical_fraction("zzz"));
+        for k in ["", "a", "quixote", "~~~", "0000"] {
+            let f = lexical_fraction(k);
+            assert!((0.0..=1.0).contains(&f), "{k:?} → {f}");
+        }
+    }
+}

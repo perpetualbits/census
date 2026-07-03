@@ -12,14 +12,29 @@ pub(crate) const LIST_CAP: i32 = 5_000;
 use crate::config::{Config, PwScheme, TunnelConfig};
 use crate::conninfo::ConnVia;
 use crate::schema::Schema;
+use super::controls;
 use super::password::crypt_sha512;
 use super::tunnel::{self, Tunnel};
+
+/// Which optional server controls the directory advertises (from the rootDSE), so
+/// census can pick a paging strategy: SSS unlocks keyset browsing of huge lists.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)] // vlv/paged drive Phase B (exact scrollbar, sequential fallback)
+pub struct Caps {
+    /// Server-Side Sort (RFC 2891) — required for keyset paging.
+    pub sss: bool,
+    /// Virtual List View (RFC 2891) — exact scrollbar position (Phase B).
+    pub vlv: bool,
+    /// Simple Paged Results (RFC 2696).
+    pub paged: bool,
+}
 
 pub struct LdapClient {
     conn: LdapConn,
     pub base_dn: String,
     schema: Schema,
     password_scheme: PwScheme,
+    caps: Caps,
     _tunnel: Option<Tunnel>,
     conn_via: ConnVia,
 }
@@ -120,14 +135,127 @@ impl LdapClient {
             }
         }
 
+        let caps = detect_caps(&mut conn);
+
         Ok(Self {
             conn,
             base_dn: cfg.server.base_dn.clone(),
             schema: Schema::rfc2307(),
             password_scheme: cfg.server.password_scheme,
+            caps,
             _tunnel: tun,
             conn_via,
         })
+    }
+
+    /// Which paging-related controls the server supports.
+    pub fn caps(&self) -> Caps { self.caps }
+
+    /// One **keyset page**: up to `limit` entries whose `sortattr` is `>=` `after`
+    /// (ascending) or `<=` `before` (returned ascending), via Server-Side Sort + a
+    /// range filter + a size limit. The seek-shaped fetch a windowed list needs.
+    /// Returns the entries (ascending key order) and whether the fetch reached the
+    /// end of the source in its direction (`rc == 0`, i.e. not size-limited).
+    /// Requires [`Caps::sss`]; the caller gates on it.
+    #[allow(clippy::too_many_arguments)] // a keyset primitive; all params are load-bearing
+    pub fn keyset_page(
+        &mut self,
+        base: &str,
+        filter: &str,
+        sortattr: &str,
+        attrs: &[&str],
+        after: Option<&str>,
+        before: Option<&str>,
+        limit: i32,
+    ) -> anyhow::Result<(Vec<SearchEntry>, bool)> {
+        let (full, reverse) = match (after, before) {
+            (Some(k), _) => (format!("(&{filter}({sortattr}>={}))", ldap3::ldap_escape(k)), false),
+            (_, Some(k)) => (format!("(&{filter}({sortattr}<={}))", ldap3::ldap_escape(k)), true),
+            (None, None) => (filter.to_string(), false),
+        };
+        let sort = controls::sort_control(sortattr, reverse);
+        let res = self.conn
+            .with_controls(sort)
+            .with_search_options(SearchOptions::new().sizelimit(limit))
+            .search(base, Scope::OneLevel, &full, attrs.to_vec())
+            .context("keyset search failed")?;
+        let reached_boundary = match res.1.rc {
+            0 => true,       // server returned all matching entries in range → end reached
+            4 => false,      // sizeLimitExceeded → more exist in this direction
+            rc => anyhow::bail!("keyset search rejected (rc {rc})"),
+        };
+        let mut entries: Vec<SearchEntry> = res.0.into_iter().map(SearchEntry::construct).collect();
+        if reverse {
+            entries.reverse(); // descending fetch → ascending key order
+        }
+        Ok((entries, reached_boundary))
+    }
+
+    /// A keyset page of [`User`]s, sorted by `uid` — the primitive [`UserSource`]
+    /// (`ldap::source`) drives to window the browse list over a huge directory.
+    /// `after`/`before` bound the range; returns `(users, reached_boundary)`.
+    pub fn page_users(
+        &mut self,
+        after: Option<&str>,
+        before: Option<&str>,
+        limit: i32,
+    ) -> anyhow::Result<(Vec<User>, bool)> {
+        let base = self.schema.user_base(&self.base_dn);
+        let filter = self.schema.user_filter;
+        let attrs = {
+            let s = &self.schema;
+            vec![s.uid, s.cn, s.sn, s.given_name, s.uid_number, s.gid_number, s.home, s.shell, s.ssh_key]
+        };
+        let (entries, boundary) =
+            self.keyset_page(&base, filter, self.schema.uid, &attrs, after, before, limit)?;
+        let schema = self.schema.clone();
+        let users = entries.into_iter().filter_map(|e| user_from_entry(e, &schema)).collect();
+        Ok((users, boundary))
+    }
+
+    /// Server-side user search: a bounded substring filter over uid/cn/sn/givenName
+    /// (plus exact uid/gidNumber when the query is numeric). Scales to huge dirs —
+    /// the server does the filtering; census only ranks the small result set.
+    pub fn search_users(&mut self, query: &str, limit: i32) -> anyhow::Result<Vec<User>> {
+        let base = self.schema.user_base(&self.base_dn);
+        let s = self.schema.clone();
+        let q = ldap3::ldap_escape(query);
+        let mut ors = format!("({}=*{q}*)({}=*{q}*)({}=*{q}*)({}=*{q}*)", s.uid, s.cn, s.sn, s.given_name);
+        if !query.is_empty() && query.bytes().all(|b| b.is_ascii_digit()) {
+            ors.push_str(&format!("({}={q})({}={q})", s.uid_number, s.gid_number));
+        }
+        let filter = format!("(&{}(|{ors}))", s.user_filter);
+        let attrs = vec![s.uid, s.cn, s.sn, s.given_name, s.uid_number, s.gid_number, s.home, s.shell, s.ssh_key];
+        let res = self.conn
+            .with_search_options(SearchOptions::new().sizelimit(limit))
+            .search(&base, Scope::OneLevel, &filter, attrs)
+            .context("user search failed")?;
+        if !matches!(res.1.rc, 0 | 4) {
+            anyhow::bail!("user search rejected (rc {})", res.1.rc);
+        }
+        Ok(res.0.into_iter().filter_map(|e| user_from_entry(SearchEntry::construct(e), &s)).collect())
+    }
+
+    /// Server-side group search: a bounded substring filter over cn (plus exact
+    /// gidNumber when numeric). Returns parsed groups (no duplicate flagging).
+    pub fn search_groups(&mut self, query: &str, limit: i32) -> anyhow::Result<Vec<Group>> {
+        let base = self.schema.group_base(&self.base_dn);
+        let s = self.schema.clone();
+        let q = ldap3::ldap_escape(query);
+        let mut ors = format!("({}=*{q}*)", s.cn);
+        if !query.is_empty() && query.bytes().all(|b| b.is_ascii_digit()) {
+            ors.push_str(&format!("({}={q})", s.gid_number));
+        }
+        let filter = format!("(&{}(|{ors}))", s.group_filter);
+        let res = self.conn
+            .with_search_options(SearchOptions::new().sizelimit(limit))
+            .search(&base, Scope::OneLevel, &filter, vec!["*"])
+            .context("group search failed")?;
+        if !matches!(res.1.rc, 0 | 4) {
+            anyhow::bail!("group search rejected (rc {})", res.1.rc);
+        }
+        let groups = res.0.into_iter().map(|e| group_from_entry(SearchEntry::construct(e), &s)).collect();
+        Ok(groups)
     }
 
     /// How this client reached the directory (direct vs SSH tunnel), for the UI.
@@ -217,36 +345,10 @@ impl LdapClient {
         // are few, so this is as cheap as fetching a handful of named attributes.
         let (rs, truncated) = self.capped_search(&base, Scope::OneLevel, filter, vec!["*"])?;
 
-        let s = &self.schema;
-        let mut groups = Vec::new();
-        for entry in rs {
-            let e = SearchEntry::construct(entry);
-            let all_cns = e.attrs.get(s.cn).cloned().unwrap_or_default();
-            // The authoritative name is the RDN value, not `cn[0]`: an entry can
-            // carry a multi-valued `cn` in any order (e.g. DN `cn=lofar` with
-            // `cn: cobalt` first), and the RDN is what actually identifies it.
-            // Never silently drop an entry: a nameless group still exists.
-            let name = rdn_value(&e.dn)
-                .filter(|v| !v.is_empty())
-                .or_else(|| all_cns.first().cloned())
-                .unwrap_or_else(|| "(no cn)".to_string());
-            let aliases: Vec<String> = all_cns.iter()
-                .filter(|c| !c.eq_ignore_ascii_case(&name))
-                .cloned()
-                .collect();
-            let gid_number = first(&e, s.gid_number).and_then(|v| v.parse::<u32>().ok());
-            let members = e.attrs.get(s.member).cloned().unwrap_or_default();
-            groups.push(Group {
-                dn: e.dn.clone(),
-                name,
-                aliases,
-                gid_number,
-                members,
-                dup_name: false,
-                dup_gid: false,
-                attrs: e.attrs,
-            });
-        }
+        let s = self.schema.clone();
+        let mut groups: Vec<Group> = rs.into_iter()
+            .map(|entry| group_from_entry(SearchEntry::construct(entry), &s))
+            .collect();
         flag_duplicates(&mut groups);
         groups.sort_by(|a, b| a.name.cmp(&b.name));
         Ok((groups, truncated))
@@ -571,6 +673,26 @@ impl LdapClient {
 
 // ---------- helpers ---------------------------------------------------------
 
+/// Read the rootDSE `supportedControl` and note the paging controls census cares
+/// about. Best-effort: any failure yields all-false (census falls back to bounded
+/// loads rather than erroring).
+fn detect_caps(conn: &mut LdapConn) -> Caps {
+    let oids: HashSet<String> = conn
+        .search("", Scope::Base, "(objectClass=*)", vec!["supportedControl"])
+        .ok()
+        .and_then(|r| r.success().ok())
+        .and_then(|(rs, _)| rs.into_iter().next())
+        .map(|e| SearchEntry::construct(e).attrs.get("supportedControl").cloned().unwrap_or_default())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    Caps {
+        sss: oids.contains(controls::SSS_OID),
+        vlv: oids.contains(controls::VLV_OID),
+        paged: oids.contains(controls::PAGED_OID),
+    }
+}
+
 fn first(entry: &SearchEntry, attr: &str) -> Option<String> {
     entry.attrs.get(attr)?.first().cloned()
 }
@@ -636,6 +758,25 @@ fn user_from_entry(e: SearchEntry, schema: &Schema) -> Option<User> {
         photo: e.bin_attrs.get(schema.photo).and_then(|v| v.first()).cloned(),
         attrs: e.attrs,
     })
+}
+
+/// Build a [`Group`] from a search entry (duplicate flags left unset — those are a
+/// whole-set computation done separately by [`flag_duplicates`]). The authoritative
+/// name is the RDN value, not `cn[0]`: an entry can carry a multi-valued `cn` in any
+/// order, and the RDN is what identifies it. A nameless group is never dropped.
+fn group_from_entry(e: SearchEntry, s: &Schema) -> Group {
+    let all_cns = e.attrs.get(s.cn).cloned().unwrap_or_default();
+    let name = rdn_value(&e.dn)
+        .filter(|v| !v.is_empty())
+        .or_else(|| all_cns.first().cloned())
+        .unwrap_or_else(|| "(no cn)".to_string());
+    let aliases: Vec<String> = all_cns.iter()
+        .filter(|c| !c.eq_ignore_ascii_case(&name))
+        .cloned()
+        .collect();
+    let gid_number = first(&e, s.gid_number).and_then(|v| v.parse::<u32>().ok());
+    let members = e.attrs.get(s.member).cloned().unwrap_or_default();
+    Group { dn: e.dn.clone(), name, aliases, gid_number, members, dup_name: false, dup_gid: false, attrs: e.attrs }
 }
 
 fn resolve_endpoint(cfg: &Config) -> anyhow::Result<(String, u16, Option<Tunnel>, ConnVia)> {
