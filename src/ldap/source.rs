@@ -27,30 +27,39 @@ pub struct UserSource {
     client: Browse,
     /// Set when a fetch failed, so the screen can surface a "browse error" note.
     err: Rc<Cell<bool>>,
-    /// Whether the server can sort server-side (keyset mode); else the cache mode.
-    sss: bool,
-    /// Client-sorted snapshot used only in the no-SSS fallback (loaded once, capped).
+    /// Whether the server supports SSS+VLV (windowed keyset paging over millions);
+    /// else the capped, client-sorted cache fallback.
+    vlv: bool,
+    /// Last VLV response: total rows (`exact_len`) and the fetched target's 1-based
+    /// position (`approx_position`) — an exact scrollbar.
+    count: u64,
+    pos: u64,
+    /// Client-sorted snapshot used only in the no-VLV fallback (loaded once, capped).
     cache: Option<Vec<User>>,
 }
 
 impl UserSource {
-    pub fn new(client: Browse, err: Rc<Cell<bool>>, sss: bool) -> Self {
-        Self { client, err, sss, cache: None }
+    pub fn new(client: Browse, err: Rc<Cell<bool>>, vlv: bool) -> Self {
+        Self { client, err, vlv, count: 0, pos: 0, cache: None }
     }
 
-    /// One server keyset page (SSS mode), swallowing errors to an empty, boundary
-    /// window.
-    fn page(&mut self, after: Option<&str>, before: Option<&str>, limit: i32) -> (Vec<User>, bool) {
-        match self.client.borrow_mut().page_users(after, before, limit) {
-            Ok(pair) => pair,
+    /// One VLV window around `target` (or the start), swallowing errors to `None` and
+    /// caching the response position/count for the scrollbar.
+    fn vlv(&mut self, target: Option<&str>, before: i32, after: i32) -> Option<Vec<User>> {
+        match self.client.borrow_mut().page_users_vlv(target, before, after.max(0)) {
+            Ok((users, pos, count)) => {
+                self.pos = pos;
+                self.count = count;
+                Some(users)
+            }
             Err(_) => {
                 self.err.set(true);
-                (Vec::new(), true)
+                None
             }
         }
     }
 
-    /// The client-sorted snapshot (no-SSS fallback), loaded once (bounded by the cap).
+    /// The client-sorted snapshot (no-VLV fallback), loaded once (bounded by the cap).
     fn cache(&mut self) -> &[User] {
         if self.cache.is_none() {
             let users = match self.client.borrow_mut().list_users() {
@@ -75,11 +84,18 @@ impl RecordSource for UserSource {
     }
 
     fn fetch_after(&mut self, key: Option<String>, n: usize) -> Window<User> {
-        if self.sss {
-            // Range `uid >= key` includes the anchor; request one extra and drop it
-            // to honour the strict-after contract.
-            let (users, boundary) = self.page(key.as_deref(), None, n as i32 + 1);
-            Window::new(assemble(users, key.as_deref(), n, false, |u| &u.uid), boundary)
+        if self.vlv {
+            // byValue(target) returns [target .. target+after]; drop the target for
+            // strict-after. From the start, byOffset offset=1 with after=n-1 gives n.
+            let after = if key.is_some() { n as i32 } else { n as i32 - 1 };
+            match self.vlv(key.as_deref(), 0, after) {
+                Some(users) => {
+                    let rows = assemble(users, key.as_deref(), n, false, |u| &u.uid);
+                    let boundary = rows.len() < n;
+                    Window::new(rows, boundary)
+                }
+                None => Window::empty(),
+            }
         } else {
             let users = self.cache();
             let start = match &key {
@@ -92,9 +108,20 @@ impl RecordSource for UserSource {
     }
 
     fn fetch_before(&mut self, key: Option<String>, n: usize) -> Window<User> {
-        if self.sss {
-            let (users, boundary) = self.page(None, key.as_deref(), n as i32 + 1);
-            Window::new(assemble(users, key.as_deref(), n, true, |u| &u.uid), boundary)
+        if self.vlv {
+            match &key {
+                // byValue(target) with before=n returns [target-n .. target]; drop target.
+                Some(k) => match self.vlv(Some(k), n as i32, 0) {
+                    Some(users) => {
+                        let rows = assemble(users, Some(k.as_str()), n, true, |u| &u.uid);
+                        let boundary = rows.len() < n;
+                        Window::new(rows, boundary)
+                    }
+                    None => Window::empty(),
+                },
+                // "last n" isn't needed by VirtualList's scroll/select paths.
+                None => Window::empty(),
+            }
         } else {
             let users = self.cache();
             let end = match &key {
@@ -107,8 +134,13 @@ impl RecordSource for UserSource {
     }
 
     fn approx_position(&mut self, key: &String) -> Option<f32> {
-        if self.sss {
-            Some(lexical_fraction(key)) // unknown length → estimate
+        if self.vlv {
+            // Exact: the fetched target's position over the total (from the VLV response).
+            if self.count > 0 {
+                Some((self.pos.saturating_sub(1) as f32 / self.count as f32).clamp(0.0, 1.0))
+            } else {
+                Some(lexical_fraction(key))
+            }
         } else {
             let users = self.cache();
             if users.is_empty() {
@@ -120,8 +152,8 @@ impl RecordSource for UserSource {
     }
 
     fn exact_len(&mut self) -> Option<u64> {
-        if self.sss {
-            None // an LDAP cursor can't count cheaply → honest estimated scrollbar
+        if self.vlv {
+            (self.count > 0).then_some(self.count) // VLV contentCount → exact scrollbar
         } else {
             Some(self.cache().len() as u64) // cache mode knows its length → exact
         }

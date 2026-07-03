@@ -151,66 +151,64 @@ impl LdapClient {
     /// Which paging-related controls the server supports.
     pub fn caps(&self) -> Caps { self.caps }
 
-    /// One **keyset page**: up to `limit` entries whose `sortattr` is `>=` `after`
-    /// (ascending) or `<=` `before` (returned ascending), via Server-Side Sort + a
-    /// range filter + a size limit. The seek-shaped fetch a windowed list needs.
-    /// Returns the entries (ascending key order) and whether the fetch reached the
-    /// end of the source in its direction (`rc == 0`, i.e. not size-limited).
-    /// Requires [`Caps::sss`]; the caller gates on it.
-    #[allow(clippy::too_many_arguments)] // a keyset primitive; all params are load-bearing
-    pub fn keyset_page(
+    /// One **VLV page**: the window of `before`+`after` entries around the sort
+    /// position of `target` (or the list start when `target` is `None`), sorted by
+    /// `sortattr` (Server-Side Sort). Unlike a `(sortattr>=key)` range filter, VLV
+    /// positions via the *sort* — so it works even when the attribute has no schema
+    /// ORDERING rule (`uid` on OpenLDAP). Returns the entries (ascending) and the VLV
+    /// response `(targetPosition, contentCount)` for an exact scrollbar. Needs SSS+VLV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vlv_page(
         &mut self,
         base: &str,
         filter: &str,
         sortattr: &str,
         attrs: &[&str],
-        after: Option<&str>,
-        before: Option<&str>,
-        limit: i32,
-    ) -> anyhow::Result<(Vec<SearchEntry>, bool)> {
-        let (full, reverse) = match (after, before) {
-            (Some(k), _) => (format!("(&{filter}({sortattr}>={}))", ldap3::ldap_escape(k)), false),
-            (_, Some(k)) => (format!("(&{filter}({sortattr}<={}))", ldap3::ldap_escape(k)), true),
-            (None, None) => (filter.to_string(), false),
+        target: Option<&str>,
+        before: i32,
+        after: i32,
+    ) -> anyhow::Result<(Vec<SearchEntry>, u64, u64)> {
+        let sss = controls::sort_control(sortattr, false);
+        let vlv = match target {
+            Some(t) => controls::vlv_by_value(before, after, t),
+            None => controls::vlv_by_offset(before, after, 1, 0),
         };
-        let sort = controls::sort_control(sortattr, reverse);
         let res = self.conn
-            .with_controls(sort)
-            .with_search_options(SearchOptions::new().sizelimit(limit))
-            .search(base, Scope::OneLevel, &full, attrs.to_vec())
-            .context("keyset search failed")?;
-        let reached_boundary = match res.1.rc {
-            0 => true,       // server returned all matching entries in range → end reached
-            4 => false,      // sizeLimitExceeded → more exist in this direction
-            rc => anyhow::bail!("keyset search rejected (rc {rc})"),
-        };
-        let mut entries: Vec<SearchEntry> = res.0.into_iter().map(SearchEntry::construct).collect();
-        if reverse {
-            entries.reverse(); // descending fetch → ascending key order
+            .with_controls(vec![sss, vlv])
+            .search(base, Scope::OneLevel, filter, attrs.to_vec())
+            .context("VLV search failed")?;
+        if !matches!(res.1.rc, 0 | 4) {
+            anyhow::bail!("VLV search rejected (rc {})", res.1.rc);
         }
-        Ok((entries, reached_boundary))
+        let (pos, count) = res.1.ctrls.iter()
+            .find(|c| c.1.ctype == controls::VLV_RESPONSE_OID)
+            .and_then(|c| c.1.val.as_deref())
+            .and_then(controls::parse_vlv_response)
+            .unwrap_or((0, 0));
+        let entries = res.0.into_iter().map(SearchEntry::construct).collect();
+        Ok((entries, pos, count))
     }
 
-    /// A keyset page of [`User`]s, sorted by `uid` — the primitive [`UserSource`]
-    /// (`ldap::source`) drives to window the browse list over a huge directory.
-    /// `after`/`before` bound the range; returns `(users, reached_boundary)`.
-    pub fn page_users(
+    /// A [`vlv_page`](Self::vlv_page) of [`User`]s sorted by `uid` — the primitive
+    /// [`UserSource`](super::source::UserSource) drives on SSS+VLV servers. Returns
+    /// `(users, targetPosition, contentCount)`.
+    pub fn page_users_vlv(
         &mut self,
-        after: Option<&str>,
-        before: Option<&str>,
-        limit: i32,
-    ) -> anyhow::Result<(Vec<User>, bool)> {
+        target: Option<&str>,
+        before: i32,
+        after: i32,
+    ) -> anyhow::Result<(Vec<User>, u64, u64)> {
         let base = self.schema.user_base(&self.base_dn);
         let filter = self.schema.user_filter;
         let attrs = {
             let s = &self.schema;
             vec![s.uid, s.cn, s.sn, s.given_name, s.uid_number, s.gid_number, s.home, s.shell, s.ssh_key]
         };
-        let (entries, boundary) =
-            self.keyset_page(&base, filter, self.schema.uid, &attrs, after, before, limit)?;
+        let (entries, pos, count) =
+            self.vlv_page(&base, filter, self.schema.uid, &attrs, target, before, after)?;
         let schema = self.schema.clone();
         let users = entries.into_iter().filter_map(|e| user_from_entry(e, &schema)).collect();
-        Ok((users, boundary))
+        Ok((users, pos, count))
     }
 
     /// Server-side user search: a bounded substring filter over uid/cn/sn/givenName

@@ -98,8 +98,10 @@ pub struct App {
     pub search_cur: ListCursor,          // selection within the results list
     search_query: String,                // the live query text
     search_caret: usize,                 // caret (byte offset) within the query field
-    search_hits: Vec<SearchHit>,         // matches, recomputed on every query edit
+    search_hits: Vec<SearchHit>,         // matches from the last server query
     search_from: Mode,                   // screen to return to on Esc
+    search_dirty: bool,                  // query edited; a debounced server search is pending
+    search_last_edit: Instant,           // when the query last changed (drives the debounce)
 
     selected_group: usize,
     pub active_pane: Pane,
@@ -125,7 +127,7 @@ impl App {
         // Window the browse list over a dedicated source before `sessions` moves in.
         let browse_err = Rc::new(Cell::new(false));
         let user_list = VirtualList::new(
-            UserSource::new(sessions[0].browse.clone(), browse_err.clone(), sessions[0].caps.sss),
+            UserSource::new(sessions[0].browse.clone(), browse_err.clone(), sessions[0].caps.vlv),
             20,  // placeholder viewport; set_viewport() tracks the real body height each frame
             64,  // fetch batch
         );
@@ -156,6 +158,8 @@ impl App {
             search_caret: 0,
             search_hits: Vec::new(),
             search_from: Mode::Browse,
+            search_dirty: false,
+            search_last_edit: Instant::now(),
             selected_group: 0,
             active_pane: Pane::Left,
             left_cur: ListCursor::new(),
@@ -406,14 +410,14 @@ impl App {
     pub fn browse_err(&self) -> bool { self.browse_err.get() }
     /// Whether the browse is true server-sorted keyset paging (scales to millions)
     /// vs. the capped client-sorted fallback used when the server lacks SSS.
-    pub fn browse_keyset(&self) -> bool { self.session().caps.sss }
+    pub fn browse_keyset(&self) -> bool { self.session().caps.vlv }
 
     /// Rebuild the browse list from the directory (after a write), preserving the
     /// selected uid — mullion's `VirtualList` has no in-place refresh.
     fn rebuild_user_list(&mut self) {
         let keep = self.user_list.selected_key().cloned();
         let vp = self.user_list.viewport();
-        let sss = self.session().caps.sss;
+        let sss = self.session().caps.vlv;
         let src = UserSource::new(self.session().browse.clone(), self.browse_err.clone(), sss);
         self.user_list = VirtualList::new(src, vp, 64);
         if let Some(k) = keep {
@@ -465,6 +469,8 @@ fn main_loop(
     // burst of keys is consumed in one frame and never blocked by a slow draw.
     let input = EventReader::new();
     loop {
+        // Fire the debounced server search once typing has settled (never per keystroke).
+        app.tick_search();
         term.draw(|buf| {
             update_offsets(app, buf.area);
             render(app, buf);
@@ -822,6 +828,7 @@ fn handle_key(
             PageUp   => app.search_cur.page(-10, app.search_hits.len()),
             PageDown => app.search_cur.page(10, app.search_hits.len()),
             Enter => {
+                app.flush_search(); // act on fresh results if a debounced search was pending
                 if let Some(hit) = app.search_hits.get(app.search_cur.cursor).cloned() {
                     match hit.kind {
                         HitKind::User => {
@@ -1402,20 +1409,45 @@ impl App {
 
     // ── cross-directory search ────────────────────────────────────────────────
 
-    /// Enter search mode: remember where we came from, clear the query, focus the
-    /// (empty) results. Read-only — usable even without `--write`.
+    /// Enter search mode: remember where we came from, clear the query and results.
+    /// Read-only — usable even without `--write`.
     fn open_search(&mut self) {
         self.search_from = self.mode;
         self.mode = Mode::Search;
         self.search_query.clear();
         self.search_caret = 0;
-        self.recompute_search();
+        self.search_hits.clear();
+        self.search_cur.reset();
+        self.search_dirty = false;
     }
 
-    /// Rebuild the results from the current query and reset the selection to the top.
+    /// Mark the query dirty; the actual (blocking) server search runs after a short
+    /// debounce (see [`tick_search`](Self::tick_search)), so typing on a huge server
+    /// doesn't fire a 0.3–1.3 s query per keystroke and freeze the UI.
     fn recompute_search(&mut self) {
-        // Server-side: the directory filters (scales to millions); census only ranks
-        // the small bounded result set with the same score()/search_hits logic.
+        self.search_dirty = true;
+        self.search_last_edit = Instant::now();
+    }
+
+    /// Run the pending search once the query has settled (called each frame).
+    fn tick_search(&mut self) {
+        if self.search_dirty && self.search_last_edit.elapsed() >= Duration::from_millis(250) {
+            self.run_search();
+            self.search_dirty = false;
+        }
+    }
+
+    /// Run any pending search *now* — used on Enter so it acts on fresh results.
+    fn flush_search(&mut self) {
+        if self.search_dirty {
+            self.run_search();
+            self.search_dirty = false;
+        }
+    }
+
+    /// The server-side query: a bounded filter (scales to millions), then rank the
+    /// small result set with the same score()/search_hits logic.
+    fn run_search(&mut self) {
         let q = self.search_query.trim().to_string();
         self.search_cur.reset();
         if q.len() < 2 {
@@ -1427,7 +1459,8 @@ impl App {
         self.search_hits = search_hits(&users, &groups, &q);
     }
 
-    /// Feed a bracketed paste into the query field (single line) and refresh matches.
+    /// Feed a bracketed paste into the query field (single line); the debounced
+    /// search picks it up.
     pub fn paste_search(&mut self, text: &str) {
         overlay::paste_into(&mut self.search_query, &mut self.search_caret, text, false);
         self.recompute_search();
