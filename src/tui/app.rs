@@ -25,12 +25,13 @@ const RENDER_TICK: Duration = Duration::from_millis(50);
 enum Mode { Browse, GroupSelect, Membership, Dit, Search }
 
 /// What a [`SearchHit`] points at, so `Enter` can jump to the right screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HitKind { User, Group }
 
 /// One row in the cross-directory search results: a user or a group that matched
 /// the query, with the display text and the key (`uid` / group `dn`) used to jump.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchHit {
     pub kind: HitKind,
     pub key: String,        // uid (user) or dn (group)
@@ -1020,7 +1021,7 @@ fn open_remove_alias(app: &mut App) {
 // ─── write chokepoint ─────────────────────────────────────────────────────────
 
 /// One-line description of the LDAP operation an action would perform (dry-run).
-fn describe_action(action: &Action) -> String {
+pub(crate) fn describe_action(action: &Action) -> String {
     match action {
         Action::SetAttr { dn, attr, values } if values.is_empty() =>
             format!("DELETE attr {attr} on {dn}"),
@@ -1444,7 +1445,7 @@ fn best(needle: &str, fields: &[&str]) -> Option<u8> {
 /// Match `query` against users and groups by first/last name, account name (uid),
 /// group name, uidNumber and gidNumber, returning display-ready hits sorted by rank
 /// (exact < prefix < substring) then label, capped at [`MAX_HITS`].
-fn search_hits(users: &[User], groups: &[Group], query: &str) -> Vec<SearchHit> {
+pub(crate) fn search_hits(users: &[User], groups: &[Group], query: &str) -> Vec<SearchHit> {
     let q = query.trim().to_lowercase();
     if q.is_empty() { return Vec::new(); }
 

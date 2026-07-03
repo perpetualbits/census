@@ -1,5 +1,6 @@
 use anyhow::Context;
 use ldap3::{LdapConn, LdapConnSettings, Mod, ResultEntry, Scope, SearchEntry, SearchOptions};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 /// Cap on how many entries a browse/list search pulls back, so a pathological
@@ -23,7 +24,7 @@ pub struct LdapClient {
     conn_via: ConnVia,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)] // full LDAP record; not every field is surfaced in the TUI yet
 pub struct User {
     pub dn: String,
@@ -39,11 +40,13 @@ pub struct User {
     pub shell: String,
     pub ssh_keys: Vec<String>,
     /// Raw `jpegPhoto` bytes, when the entry carries one (binary attribute).
+    /// Skipped in JSON output (binary); `attrs` carries the textual record.
+    #[serde(skip)]
     pub photo: Option<Vec<u8>>,
     pub attrs: HashMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Group {
     pub dn: String,
     /// Authoritative name: the RDN value from the DN (e.g. `cn=lofar` → `lofar`).
@@ -77,7 +80,7 @@ pub struct NewUserSpec {
 }
 
 /// One child entry in the directory tree, for the DIT browser.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DitNode {
     pub dn: String,
     /// The RDN value, shown as the tree label (e.g. `ou=users` → `users`).

@@ -1,3 +1,4 @@
+mod cli;
 mod config;
 mod conninfo;
 mod ldap;
@@ -10,28 +11,31 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use config::Config;
-use ldap::LdapClient;
 use session::Session;
 
 #[derive(Parser, Debug)]
-#[command(name = "census", about = "LDAP user and group administration TUI")]
+#[command(name = "census", about = "LDAP user and group administration — TUI and scripting CLI")]
 struct Args {
     /// Path to config file (default: ~/.config/census/config.toml)
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 
     /// Allow write operations (add/remove group members, edit attributes)
-    #[arg(long)]
+    #[arg(long, global = true)]
     write: bool,
 
-    /// Walk through every write flow but send nothing — each commit reports
-    /// the LDAP operation it *would* perform. Implies write-capable UI.
-    #[arg(long)]
+    /// Walk through every write flow but send nothing — each write reports the
+    /// LDAP operation it *would* perform (and its LDIF). Implies write-capable.
+    #[arg(long, global = true)]
     dry_run: bool,
 
-    /// Connect and exit; prints user and group counts. Useful for testing.
+    /// Connect and exit; prints user and group counts. (Alias for `census ping`.)
     #[arg(long)]
     ping: bool,
+
+    /// A scripting subcommand. Omit it to launch the interactive TUI.
+    #[command(subcommand)]
+    command: Option<cli::Command>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -43,42 +47,16 @@ fn main() -> anyhow::Result<()> {
 
     let (password, pw_source) = get_password(&cfg);
 
+    // A subcommand runs headless and exits; the legacy `--ping` flag maps to it.
+    if let Some(cmd) = args.command {
+        return cli::dispatch(cmd, &cfg, password.as_deref(), allow_writes, args.dry_run);
+    }
     if args.ping {
-        return cmd_ping(&cfg, password.as_deref(), allow_writes);
+        return cli::dispatch(cli::Command::Ping, &cfg, password.as_deref(), allow_writes, args.dry_run);
     }
 
     let session = Session::connect(&cfg, password.as_deref(), pw_source, "(default)".into())?;
     tui::run(vec![session], allow_writes, args.dry_run)
-}
-
-fn cmd_ping(cfg: &Config, password: Option<&str>, allow_writes: bool) -> anyhow::Result<()> {
-    let mode = if cfg.tunnel.enabled { "tunnel" } else { "direct" };
-    let tls  = if cfg.server.use_ssl { "LDAPS" } else if cfg.server.start_tls { "LDAP+STARTTLS" } else { "LDAP" };
-    eprintln!("Connecting ({mode}, {tls}) to {}:{} …", cfg.server.host, cfg.server.port);
-
-    let mut client = LdapClient::connect(cfg, password)?;
-    client.ping()?;
-    eprintln!("Bind OK");
-
-    let (users, users_capped)   = client.list_users()?;
-    let (groups, groups_capped) = client.list_groups()?;
-
-    println!("Users  ({}{}):  {}", users.len(), if users_capped { "+" } else { "" },
-             users.iter().map(|u| u.uid.as_str()).collect::<Vec<_>>().join("  "));
-    println!("Groups ({}{}):  {}", groups.len(), if groups_capped { "+" } else { "" },
-             groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join("  "));
-    if users_capped || groups_capped {
-        eprintln!("NOTE: list capped at the browse size limit — more entries exist than shown");
-    }
-
-    if allow_writes {
-        eprintln!("Write mode ENABLED");
-    } else {
-        eprintln!("Read-only mode (pass --write to enable modifications)");
-    }
-
-    client.close()?;
-    Ok(())
 }
 
 fn get_password(cfg: &Config) -> (Option<String>, conninfo::PwSource) {
