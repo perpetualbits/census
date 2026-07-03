@@ -39,11 +39,6 @@ pub fn vscroll(buf: &mut Buffer, area: Rect, offset: usize, len: usize, vis: usi
         return area;
     }
     let bar = Rect::new(area.x + area.width - 1, area.y, 1, area.height);
-    let metrics = ScrollMetrics {
-        position: offset as f32 / len as f32,
-        extent:   vis as f32 / len as f32,
-        exact:    true,
-    };
-    render_scrollbar(buf, bar, metrics, s_dim());
+    render_scrollbar(buf, bar, ScrollMetrics::from_window(offset, vis, len), s_dim());
     Rect::new(area.x, area.y, area.width - 1, area.height)
 }
