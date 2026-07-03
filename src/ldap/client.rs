@@ -1,6 +1,12 @@
 use anyhow::Context;
-use ldap3::{LdapConn, LdapConnSettings, Mod, Scope, SearchEntry};
+use ldap3::{LdapConn, LdapConnSettings, Mod, ResultEntry, Scope, SearchEntry, SearchOptions};
 use std::collections::{HashMap, HashSet};
+
+/// Cap on how many entries a browse/list search pulls back, so a pathological
+/// container (a huge `ou`, a DNS zone) degrades to "first N shown" instead of
+/// hanging the UI or exhausting memory. Far above any real census user/group list;
+/// census is not (yet) a virtualized browser — see docs/mullion-asks-round4.md.
+pub(crate) const LIST_CAP: i32 = 5_000;
 
 use crate::config::{Config, PwScheme, TunnelConfig};
 use crate::conninfo::ConnVia;
@@ -139,18 +145,35 @@ impl LdapClient {
         Ok(())
     }
 
+    /// Run a size-capped browse search ([`LIST_CAP`]). Returns the entries and whether
+    /// the server hit the cap: `sizeLimitExceeded` (rc 4) means the partial results are
+    /// valid and more entries exist; rc 0 is a complete result; any other non-zero rc is
+    /// a real error.
+    fn capped_search(&mut self, base: &str, scope: Scope, filter: &str, attrs: Vec<&str>)
+        -> anyhow::Result<(Vec<ResultEntry>, bool)>
+    {
+        let res = self.conn
+            .with_search_options(SearchOptions::new().sizelimit(LIST_CAP))
+            .search(base, scope, filter, attrs)
+            .context("search failed")?;
+        match res.1.rc {
+            0 => Ok((res.0, false)),
+            4 => Ok((res.0, true)), // sizeLimitExceeded: partial results are valid
+            rc => anyhow::bail!("search rejected (rc {rc})"),
+        }
+    }
+
     // ---------- users -------------------------------------------------------
 
-    pub fn list_users(&mut self) -> anyhow::Result<Vec<User>> {
-        let s = &self.schema;
-        let base = s.user_base(&self.base_dn);
-        let attrs = vec![s.uid, s.cn, s.sn, s.given_name, s.uid_number, s.gid_number,
-                         s.home, s.shell, s.ssh_key];
-        let (rs, _) = self.conn
-            .search(&base, Scope::OneLevel, s.user_filter, attrs)
-            .context("User search failed")?
-            .success()
-            .context("User search rejected")?;
+    pub fn list_users(&mut self) -> anyhow::Result<(Vec<User>, bool)> {
+        let base = self.schema.user_base(&self.base_dn);
+        let filter = self.schema.user_filter;
+        let attrs = {
+            let s = &self.schema;
+            vec![s.uid, s.cn, s.sn, s.given_name, s.uid_number, s.gid_number,
+                 s.home, s.shell, s.ssh_key]
+        };
+        let (rs, truncated) = self.capped_search(&base, Scope::OneLevel, filter, attrs)?;
 
         let s = self.schema.clone();
         let mut users = Vec::new();
@@ -161,7 +184,7 @@ impl LdapClient {
             }
         }
         users.sort_by(|a, b| a.uid.cmp(&b.uid));
-        Ok(users)
+        Ok((users, truncated))
     }
 
     /// Fetch a single user with all attributes (`*` + operational `+`).
@@ -184,16 +207,12 @@ impl LdapClient {
 
     // ---------- groups ------------------------------------------------------
 
-    pub fn list_groups(&mut self) -> anyhow::Result<Vec<Group>> {
-        let s = &self.schema;
-        let base = s.group_base(&self.base_dn);
+    pub fn list_groups(&mut self) -> anyhow::Result<(Vec<Group>, bool)> {
+        let base = self.schema.group_base(&self.base_dn);
+        let filter = self.schema.group_filter;
         // Fetch the full attribute set so the group detail pane can render it — groups
         // are few, so this is as cheap as fetching a handful of named attributes.
-        let (rs, _) = self.conn
-            .search(&base, Scope::OneLevel, s.group_filter, vec!["*"])
-            .context("Group search failed")?
-            .success()
-            .context("Group search rejected")?;
+        let (rs, truncated) = self.capped_search(&base, Scope::OneLevel, filter, vec!["*"])?;
 
         let s = &self.schema;
         let mut groups = Vec::new();
@@ -227,7 +246,7 @@ impl LdapClient {
         }
         flag_duplicates(&mut groups);
         groups.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(groups)
+        Ok((groups, truncated))
     }
 
     // ---------- group membership (write ops) --------------------------------
@@ -511,12 +530,9 @@ impl LdapClient {
 
     /// One level of children directly under `base` (for the tree browser). Sorted
     /// by RDN. An empty result means `base` is a leaf.
-    pub fn list_children(&mut self, base: &str) -> anyhow::Result<Vec<DitNode>> {
-        let (rs, _) = self.conn
-            .search(base, Scope::OneLevel, "(objectClass=*)", vec!["1.1"])
-            .context("DIT children search failed")?
-            .success()
-            .context("DIT children search rejected")?;
+    pub fn list_children(&mut self, base: &str) -> anyhow::Result<(Vec<DitNode>, bool)> {
+        let (rs, truncated) =
+            self.capped_search(base, Scope::OneLevel, "(objectClass=*)", vec!["1.1"])?;
         let mut out = Vec::new();
         for entry in rs {
             let e = SearchEntry::construct(entry);
@@ -524,7 +540,7 @@ impl LdapClient {
             out.push(DitNode { dn: e.dn, rdn });
         }
         out.sort_by_key(|n| n.rdn.to_lowercase());
-        Ok(out)
+        Ok((out, truncated))
     }
 
     /// An entry's attributes as displayable strings (binary values shown as a

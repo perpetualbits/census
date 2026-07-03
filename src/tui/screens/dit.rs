@@ -63,7 +63,8 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect) {
 fn render_tree(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
     if area.width < 8 { return; }
     let hs = if focused { s_head() } else { s_subhead() };
-    ColumnGrid::write_text(buf, area, area.y, &format!("tree ({})", app.dit_rows().len()), Align::Start, hs);
+    let cap = if app.dit_root_truncated() { " — capped" } else { "" };
+    ColumnGrid::write_text(buf, area, area.y, &format!("tree ({}{})", app.dit_rows().len(), cap), Align::Start, hs);
     hline(buf, Rect::new(area.x, area.y + 1, area.width, 1));
 
     let data = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(2));

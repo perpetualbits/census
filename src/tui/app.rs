@@ -77,6 +77,7 @@ pub struct App {
     pub dit_cur: ListCursor,
     pub dit_detail_cur: usize,
     dit_children: HashMap<String, Vec<DitNode>>, // parent DN → its children (lazy cache)
+    dit_truncated: HashSet<String>,              // DNs whose child fetch hit the size cap
     dit_expanded: HashSet<String>,               // DNs currently expanded
     dit_rows: Vec<DitRow>,                        // flattened visible rows (rebuilt on change)
     dit_detail: Vec<(String, Vec<String>)>,      // selected entry's attributes
@@ -125,6 +126,7 @@ impl App {
             dit_cur: ListCursor::new(),
             dit_detail_cur: 0,
             dit_children: HashMap::new(),
+            dit_truncated: HashSet::new(),
             dit_expanded: HashSet::new(),
             dit_rows: Vec::new(),
             dit_detail: Vec::new(),
@@ -166,6 +168,12 @@ impl App {
     pub fn users(&self) -> &[User] { &self.session().users }
     pub fn groups(&self) -> &[Group] { &self.session().groups }
 
+    /// Whether the user/group list was capped at the browse size limit (more exist).
+    pub fn users_truncated(&self) -> bool { self.session().users_truncated }
+    pub fn groups_truncated(&self) -> bool { self.session().groups_truncated }
+    /// Whether the DIT root's children were capped (drives a header marker).
+    pub fn dit_root_truncated(&self) -> bool { self.dit_truncated.contains(&self.dit_base()) }
+
     pub fn detail(&self) -> Option<&User> { self.detail.as_ref() }
 
     /// Connection/password facts for the active session (drives the top-border gap).
@@ -192,9 +200,11 @@ impl App {
         self.dit_cur.reset();
         self.dit_detail_cur = 0;
         self.dit_children.clear();
+        self.dit_truncated.clear();
         self.dit_expanded.clear();
         let base = self.dit_base();
-        if let Ok(kids) = self.session_mut().client.list_children(&base) {
+        if let Ok((kids, trunc)) = self.session_mut().client.list_children(&base) {
+            if trunc { self.dit_truncated.insert(base.clone()); }
             self.dit_children.insert(base, kids);
         }
         self.rebuild_dit_rows();
@@ -224,9 +234,15 @@ impl App {
         } else {
             Some(false)
         };
+        // A capped node has more children than were fetched — flag it so the operator
+        // isn't misled into thinking the shown children are all of them.
+        let mut label = node.rdn.clone();
+        if self.dit_truncated.contains(&node.dn) {
+            label.push_str("  ⋯ capped");
+        }
         rows.push(DitRow {
             dn: node.dn.clone(),
-            label: node.rdn.clone(),
+            label,
             ancestor_last: ancestor_last.to_vec(),
             is_last,
             expanded,
@@ -266,7 +282,10 @@ impl App {
         } else {
             if !self.dit_children.contains_key(&dn) {
                 match self.session_mut().client.list_children(&dn) {
-                    Ok(kids) => { self.dit_children.insert(dn.clone(), kids); }
+                    Ok((kids, trunc)) => {
+                        if trunc { self.dit_truncated.insert(dn.clone()); }
+                        self.dit_children.insert(dn.clone(), kids);
+                    }
                     Err(e) => { self.status = Some((format!("expand failed: {e}"), true)); return; }
                 }
             }
@@ -293,8 +312,10 @@ impl App {
         let mut targets: Vec<String> = vec![base];
         targets.extend(self.dit_expanded.iter().cloned());
         self.dit_children.clear();
+        self.dit_truncated.clear();
         for dn in targets {
-            if let Ok(kids) = self.session_mut().client.list_children(&dn) {
+            if let Ok((kids, trunc)) = self.session_mut().client.list_children(&dn) {
+                if trunc { self.dit_truncated.insert(dn.clone()); }
                 self.dit_children.insert(dn, kids);
             }
         }

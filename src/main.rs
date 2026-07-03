@@ -60,11 +60,16 @@ fn cmd_ping(cfg: &Config, password: Option<&str>, allow_writes: bool) -> anyhow:
     client.ping()?;
     eprintln!("Bind OK");
 
-    let users  = client.list_users()?;
-    let groups = client.list_groups()?;
+    let (users, users_capped)   = client.list_users()?;
+    let (groups, groups_capped) = client.list_groups()?;
 
-    println!("Users  ({}):  {}", users.len(),  users.iter().map(|u| u.uid.as_str()).collect::<Vec<_>>().join("  "));
-    println!("Groups ({}):  {}", groups.len(), groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join("  "));
+    println!("Users  ({}{}):  {}", users.len(), if users_capped { "+" } else { "" },
+             users.iter().map(|u| u.uid.as_str()).collect::<Vec<_>>().join("  "));
+    println!("Groups ({}{}):  {}", groups.len(), if groups_capped { "+" } else { "" },
+             groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join("  "));
+    if users_capped || groups_capped {
+        eprintln!("NOTE: list capped at the browse size limit — more entries exist than shown");
+    }
 
     if allow_writes {
         eprintln!("Write mode ENABLED");

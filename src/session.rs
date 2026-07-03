@@ -16,6 +16,9 @@ pub struct Session {
     pub client: LdapClient,
     pub users: Vec<User>,
     pub groups: Vec<Group>,
+    /// `true` when the user/group load hit the server size cap (more exist than loaded).
+    pub users_truncated: bool,
+    pub groups_truncated: bool,
     /// How this session reached the directory + got its password (for the UI gap).
     pub conn: ConnInfo,
 }
@@ -29,20 +32,24 @@ impl Session {
         let tls = if cfg.server.use_ssl { "LDAPS" }
                   else if cfg.server.start_tls { "STARTTLS" } else { "LDAP" };
         let conn = ConnInfo { via: client.conn_via().clone(), tls, password: pw_source };
-        let users = client.list_users()?;
-        let groups = client.list_groups()?;
-        Ok(Self { label, client, users, groups, conn })
+        let (users, users_truncated) = client.list_users()?;
+        let (groups, groups_truncated) = client.list_groups()?;
+        Ok(Self { label, client, users, groups, users_truncated, groups_truncated, conn })
     }
 
     /// Re-read the user list from the directory.
     pub fn refresh_users(&mut self) -> anyhow::Result<()> {
-        self.users = self.client.list_users()?;
+        let (users, truncated) = self.client.list_users()?;
+        self.users = users;
+        self.users_truncated = truncated;
         Ok(())
     }
 
     /// Re-read the group list from the directory.
     pub fn refresh_groups(&mut self) -> anyhow::Result<()> {
-        self.groups = self.client.list_groups()?;
+        let (groups, truncated) = self.client.list_groups()?;
+        self.groups = groups;
+        self.groups_truncated = truncated;
         Ok(())
     }
 

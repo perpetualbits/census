@@ -76,8 +76,12 @@ pub fn render_select(app: &App, buf: &mut Buffer, area: Rect) {
 fn render_group_list(app: &App, buf: &mut Buffer, inner: Rect, focused: bool) {
     if inner.height < 3 { return; }
     let hs = if focused { s_head() } else { s_subhead() };
-    ColumnGrid::write_text(buf, inner, inner.y, &format!("groups ({})", app.groups().len()),
-                           Align::Start, hs);
+    let label = if app.groups_truncated() {
+        format!("groups ({} — capped)", app.groups().len())
+    } else {
+        format!("groups ({})", app.groups().len())
+    };
+    ColumnGrid::write_text(buf, inner, inner.y, &label, Align::Start, hs);
     hline(buf, Rect::new(inner.x, inner.y + 1, inner.width, 1));
 
     let data = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(2));

@@ -73,7 +73,11 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focus: Pane) {
 
 fn render_list(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
     let hs    = if focused { s_head() } else { s_subhead() };
-    let label = format!("users ({})", app.users().len());
+    let label = if app.users_truncated() {
+        format!("users ({} — capped)", app.users().len())
+    } else {
+        format!("users ({})", app.users().len())
+    };
     ColumnGrid::write_text(buf, area, area.y, &label, Align::Start, hs);
     hline(buf, Rect::new(area.x, area.y + 1, area.width, 1));
 
