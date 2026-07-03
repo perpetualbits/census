@@ -105,7 +105,9 @@ fn render_group_list(app: &App, buf: &mut Buffer, inner: Rect, focused: bool) {
         } else {
             format!("  aka {}", g.aliases.join(","))
         };
-        let label = format!("{}  gid {}{}  ({})", g.name, gid, alias, g.members.len());
+        // No member count: members aren't loaded for the list (a group can hold
+        // millions of members — see list_groups). Membership editor loads them per-group.
+        let label = format!("{}  gid {}{}", g.name, gid, alias);
         ColumnGrid::write_text(buf, content, y, &label, Align::Start, sty);
 
         // Right-aligned collision marker, so duplicates are unmistakable.

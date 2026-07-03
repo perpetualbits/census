@@ -341,9 +341,13 @@ impl LdapClient {
     pub fn list_groups(&mut self) -> anyhow::Result<(Vec<Group>, bool)> {
         let base = self.schema.group_base(&self.base_dn);
         let filter = self.schema.group_filter;
-        // Fetch the full attribute set so the group detail pane can render it — groups
-        // are few, so this is as cheap as fetching a handful of named attributes.
-        let (rs, truncated) = self.capped_search(&base, Scope::OneLevel, filter, vec!["*"])?;
+        // Fetch ONLY the list-visible attributes (name + gidNumber) — never `memberUid`.
+        // On a large directory a single group can hold millions of members, so pulling
+        // `*` here loaded gigabytes and stalled startup. Members are read on demand for
+        // the one group whose membership is being edited (see `group_members`).
+        let s = &self.schema;
+        let attrs = vec![s.cn, s.gid_number];
+        let (rs, truncated) = self.capped_search(&base, Scope::OneLevel, filter, attrs)?;
 
         let s = self.schema.clone();
         let mut groups: Vec<Group> = rs.into_iter()
