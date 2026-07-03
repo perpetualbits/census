@@ -73,6 +73,9 @@ fn render_list(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
     // window ("N shown", `+` when more exist below), not a (misleading) count.
     let more = if list.at_top() && list.at_bottom() { "" } else { "+" };
     let mut label = format!("users ({}{more} shown)", list.visible().len());
+    // On a server without Server-Side Sort the browse is a capped, client-sorted
+    // window — say so, since you can't page the whole (millions-row) set in order.
+    if !app.browse_keyset() { label.push_str(" · capped (no server sort)"); }
     if app.browse_err() { label.push_str(" — browse error"); }
     ColumnGrid::write_text(buf, area, area.y, &label, Align::Start, hs);
     hline(buf, Rect::new(area.x, area.y + 1, area.width, 1));

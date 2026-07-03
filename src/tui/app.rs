@@ -404,6 +404,9 @@ impl App {
     pub fn user_metrics(&self) -> ScrollMetrics { self.user_metrics }
     /// Whether a browse fetch has errored this session (surfaced in the header).
     pub fn browse_err(&self) -> bool { self.browse_err.get() }
+    /// Whether the browse is true server-sorted keyset paging (scales to millions)
+    /// vs. the capped client-sorted fallback used when the server lacks SSS.
+    pub fn browse_keyset(&self) -> bool { self.session().caps.sss }
 
     /// Rebuild the browse list from the directory (after a write), preserving the
     /// selected uid — mullion's `VirtualList` has no in-place refresh.
