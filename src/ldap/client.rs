@@ -35,6 +35,10 @@ pub struct LdapClient {
     schema: Schema,
     password_scheme: PwScheme,
     caps: Caps,
+    /// Attribute + orderingRule OID the browse list is sorted by (from `[browse]`
+    /// config; default `uid` / caseIgnoreOrderingMatch). See [`BrowseConfig`].
+    browse_sort_attr: String,
+    browse_sort_ordering: String,
     _tunnel: Option<Tunnel>,
     conn_via: ConnVia,
 }
@@ -58,6 +62,12 @@ pub struct User {
     /// Skipped in JSON output (binary); `attrs` carries the textual record.
     #[serde(skip)]
     pub photo: Option<Vec<u8>>,
+    /// The browse **paging key**: the value of the configured browse sort attribute
+    /// (default `uid`, e.g. `sortRank`). Set only on the VLV browse path
+    /// ([`page_users_vlv`](LdapClient::page_users_vlv)); empty elsewhere, where the
+    /// source falls back to keying by `uid`. Internal — not part of the JSON record.
+    #[serde(skip)]
+    pub sort_key: String,
     pub attrs: HashMap<String, Vec<String>>,
 }
 
@@ -143,6 +153,8 @@ impl LdapClient {
             schema: Schema::rfc2307(),
             password_scheme: cfg.server.password_scheme,
             caps,
+            browse_sort_attr: cfg.browse.sort_attr.clone(),
+            browse_sort_ordering: cfg.browse.sort_ordering.clone(),
             _tunnel: tun,
             conn_via,
         })
@@ -163,12 +175,13 @@ impl LdapClient {
         base: &str,
         filter: &str,
         sortattr: &str,
+        ordering: &str,
         attrs: &[&str],
         target: Option<&str>,
         before: i32,
         after: i32,
     ) -> anyhow::Result<(Vec<SearchEntry>, u64, u64)> {
-        let sss = controls::sort_control(sortattr, false);
+        let sss = controls::sort_control(sortattr, ordering, false);
         let vlv = match target {
             Some(t) => controls::vlv_by_value(before, after, t),
             None => controls::vlv_by_offset(before, after, 1, 0),
@@ -189,9 +202,11 @@ impl LdapClient {
         Ok((entries, pos, count))
     }
 
-    /// A [`vlv_page`](Self::vlv_page) of [`User`]s sorted by `uid` — the primitive
-    /// [`UserSource`](super::source::UserSource) drives on SSS+VLV servers. Returns
-    /// `(users, targetPosition, contentCount)`.
+    /// A [`vlv_page`](Self::vlv_page) of [`User`]s sorted by the configured **browse
+    /// sort attribute** (default `uid`; e.g. a precomputed `sortRank`) — the primitive
+    /// [`UserSource`](super::source::UserSource) drives on SSS+VLV servers. Each user's
+    /// [`sort_key`](User::sort_key) is set from that attribute so the source can key its
+    /// window by it. Returns `(users, targetPosition, contentCount)`.
     pub fn page_users_vlv(
         &mut self,
         target: Option<&str>,
@@ -200,14 +215,24 @@ impl LdapClient {
     ) -> anyhow::Result<(Vec<User>, u64, u64)> {
         let base = self.schema.user_base(&self.base_dn);
         let filter = self.schema.user_filter;
-        let attrs = {
+        let sort_attr = self.browse_sort_attr.clone();
+        let ordering = self.browse_sort_ordering.clone();
+        let mut attrs = {
             let s = &self.schema;
             vec![s.uid, s.cn, s.sn, s.given_name, s.uid_number, s.gid_number, s.home, s.shell, s.ssh_key]
         };
+        // Fetch the sort attribute too (unless it's already among the user attrs), so
+        // each row carries its own paging key.
+        if !attrs.contains(&sort_attr.as_str()) {
+            attrs.push(sort_attr.as_str());
+        }
         let (entries, pos, count) =
-            self.vlv_page(&base, filter, self.schema.uid, &attrs, target, before, after)?;
+            self.vlv_page(&base, filter, &sort_attr, &ordering, &attrs, target, before, after)?;
         let schema = self.schema.clone();
-        let users = entries.into_iter().filter_map(|e| user_from_entry(e, &schema)).collect();
+        let users = entries.into_iter()
+            .filter_map(|e| user_from_entry(e, &schema))
+            .map(|mut u| { set_sort_key(&mut u, &sort_attr); u })
+            .collect();
         Ok((users, pos, count))
     }
 
@@ -758,8 +783,19 @@ fn user_from_entry(e: SearchEntry, schema: &Schema) -> Option<User> {
         ssh_keys: e.attrs.get(schema.ssh_key).cloned().unwrap_or_default(),
         // jpegPhoto is binary, so ldap3 surfaces it under `bin_attrs`, not `attrs`.
         photo: e.bin_attrs.get(schema.photo).and_then(|v| v.first()).cloned(),
+        sort_key: String::new(), // set by the VLV browse path via set_sort_key
         attrs: e.attrs,
     })
+}
+
+/// Set a user's [`sort_key`](User::sort_key) from the browse sort attribute's value
+/// (falling back to `uid` if the entry didn't carry it), so the browse source can key
+/// its window by whatever attribute the server sorted on.
+fn set_sort_key(u: &mut User, sort_attr: &str) {
+    u.sort_key = u.attrs.get(sort_attr)
+        .and_then(|v| v.first())
+        .cloned()
+        .unwrap_or_else(|| u.uid.clone());
 }
 
 /// Build a [`Group`] from a search entry (duplicate flags left unset — those are a

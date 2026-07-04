@@ -34,3 +34,17 @@ remote_port = 636
 
 [display]
 # allow_writes = false    # require --write flag to perform any modifications
+
+[browse]
+# How the user browse list is ordered (pushed to the server as Server-Side Sort +
+# VLV). The defaults sort by `uid` with string ordering — leave them as-is for most
+# directories.
+#
+# If your directory ships a PRECOMPUTED sort-key attribute with a VLV browsing index
+# — e.g. an integer `sortRank` giving a surname-then-given order over millions of
+# entries — point census at it so an ordered browse hits the index (fast) instead of
+# an in-memory re-sort. `sort_attr` must be unique per entry (it doubles as the paging
+# key), and `sort_ordering` must be the SAME orderingRule OID the index was built with
+# or the server won't use the index.
+# sort_attr     = "uid"        # default; e.g. "sortRank"
+# sort_ordering = "2.5.13.3"   # caseIgnoreOrderingMatch (string); "2.5.13.15" = integerOrderingMatch

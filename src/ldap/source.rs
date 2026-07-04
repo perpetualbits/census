@@ -75,12 +75,19 @@ impl UserSource {
     }
 }
 
+/// The paging key of a user: the browse **sort_key** (the configured sort attribute's
+/// value, e.g. a `sortRank`) when the VLV path set it, else the `uid` — so the fallback
+/// cache mode (which never sets it) keys by `uid` as before.
+fn user_key(u: &User) -> &str {
+    if u.sort_key.is_empty() { &u.uid } else { &u.sort_key }
+}
+
 impl RecordSource for UserSource {
     type Key = String;
     type Row = User;
 
     fn key_of(&self, row: &User) -> String {
-        row.uid.clone()
+        user_key(row).to_string()
     }
 
     fn fetch_after(&mut self, key: Option<String>, n: usize) -> Window<User> {
@@ -90,7 +97,7 @@ impl RecordSource for UserSource {
             let after = if key.is_some() { n as i32 } else { n as i32 - 1 };
             match self.vlv(key.as_deref(), 0, after) {
                 Some(users) => {
-                    let rows = assemble(users, key.as_deref(), n, false, |u| &u.uid);
+                    let rows = assemble(users, key.as_deref(), n, false, |u| user_key(u));
                     let boundary = rows.len() < n;
                     Window::new(rows, boundary)
                 }
@@ -113,7 +120,7 @@ impl RecordSource for UserSource {
                 // byValue(target) with before=n returns [target-n .. target]; drop target.
                 Some(k) => match self.vlv(Some(k), n as i32, 0) {
                     Some(users) => {
-                        let rows = assemble(users, Some(k.as_str()), n, true, |u| &u.uid);
+                        let rows = assemble(users, Some(k.as_str()), n, true, |u| user_key(u));
                         let boundary = rows.len() < n;
                         Window::new(rows, boundary)
                     }
@@ -195,6 +202,8 @@ mod tests {
     use super::{assemble, lexical_fraction};
 
     fn ks(s: &[&str]) -> Vec<String> { s.iter().map(|x| x.to_string()).collect() }
+    // Signature must be `&String` to match `assemble`'s `Fn(&T) -> &str` with T=String.
+    #[allow(clippy::ptr_arg)]
     fn key(s: &String) -> &str { s.as_str() }
 
     #[test]

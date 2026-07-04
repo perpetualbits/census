@@ -68,6 +68,9 @@ pub struct App {
     // Browse screen — the windowed user list runs on a background thread (browse.rs)
     // so a slow server fetch never blocks the UI; here we hold the latest snapshot.
     browse: Browse,
+    // The attribute the browse is sorted/keyed by (`[browse] sort_attr`, default `uid`),
+    // used to turn a search hit's uid into its VLV paging key.
+    browse_sort_attr: String,
 
     // Browse screen.
     pub browse_focus: Pane,
@@ -121,11 +124,14 @@ pub struct App {
 
 impl App {
     fn new(sessions: Vec<Session>, write_mode: bool, dry_run: bool, cfg: Config, password: Option<String>) -> Self {
+        // The attribute the browse list is sorted/keyed by; needed to resolve a
+        // search-jump's paging key (captured before `cfg` moves into the worker).
+        let browse_sort_attr = cfg.browse.sort_attr.clone();
         // The browse list runs on its own thread with its own read-only connection.
         let browse = Browse::spawn(cfg, password, 20);
         Self {
             sessions, active: 0, mode: Mode::Browse,
-            browse,
+            browse, browse_sort_attr,
             groups_cur: ListCursor::new(),
             browse_focus: Pane::Left,
             detail_scroll: 0,
@@ -405,7 +411,7 @@ impl App {
     /// Refresh the browse list after a write, preserving the selected uid (the
     /// worker rebuilds; there is no in-place refresh).
     fn rebuild_user_list(&mut self) {
-        let keep = self.browse.selected_uid();
+        let keep = self.browse.selected_key();
         self.browse.rebuild(keep);
     }
 
@@ -1367,9 +1373,29 @@ impl App {
 
     /// Jump the browse cursor to `uid` (seeking the server if needed) and load detail.
     fn select_user(&mut self, uid: &str) {
-        self.browse.select_key(uid);
+        let key = self.browse_paging_key(uid);
+        self.browse.select_key(&key);
         self.load_detail(None);
         self.ensure_detail_loaded();
+    }
+
+    /// The browse **paging key** for a uid: the uid itself when the browse is sorted by
+    /// `uid` (the common case, no round-trip); otherwise the value of the configured
+    /// sort attribute (e.g. `sortRank`), looked up via `get_user`. Falls back to the uid
+    /// if the lookup fails or the entry lacks the attribute — the jump may then miss,
+    /// but nothing breaks.
+    fn browse_paging_key(&mut self, uid: &str) -> String {
+        if self.browse_sort_attr == "uid" {
+            return uid.to_string();
+        }
+        let attr = self.browse_sort_attr.clone();
+        match self.session_mut().client.get_user(uid) {
+            Ok(Some(u)) => u.attrs.get(&attr)
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_else(|| uid.to_string()),
+            _ => uid.to_string(),
+        }
     }
 
     /// Rebuild the browse list after a delete and reload detail (the cursor lands on
@@ -1582,7 +1608,7 @@ mod search_tests {
             sn: sn.into(), given_name: given.into(),
             uid_number: uidn, gid_number: gidn,
             home: String::new(), shell: String::new(),
-            ssh_keys: Vec::new(), photo: None, attrs: HashMap::new(),
+            ssh_keys: Vec::new(), photo: None, sort_key: String::new(), attrs: HashMap::new(),
         }
     }
     fn group(name: &str, gid: Option<u32>, aliases: &[&str]) -> Group {

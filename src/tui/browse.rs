@@ -116,9 +116,19 @@ impl Browse {
     pub fn select_key(&mut self, uid: &str) { self.send(Cmd::Key(uid.to_string())); }
     pub fn rebuild(&mut self, keep: Option<String>) { self.send(Cmd::Rebuild(keep)); }
 
-    /// The selected user's uid, from the latest snapshot.
+    /// The selected user's uid, from the latest snapshot (the entry identity — used to
+    /// load its detail record).
     pub fn selected_uid(&self) -> Option<String> {
         self.snapshot.selected_user().map(|u| u.uid.clone())
+    }
+
+    /// The selected user's **paging key** — the browse sort_key (e.g. its `sortRank`),
+    /// or `uid` when unset. This, not the uid, is what [`select_key`](Self::select_key)
+    /// and [`rebuild`](Self::rebuild) seek by, so a rebuild lands on the same row.
+    pub fn selected_key(&self) -> Option<String> {
+        self.snapshot.selected_user().map(|u| {
+            if u.sort_key.is_empty() { u.uid.clone() } else { u.sort_key.clone() }
+        })
     }
 }
 

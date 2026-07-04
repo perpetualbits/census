@@ -23,26 +23,34 @@ pub const VLV_RESPONSE_OID: &str = "2.16.840.1.113730.3.4.10";
 /// Simple Paged Results control OID (RFC 2696) — advertised by nearly every server.
 pub const PAGED_OID: &str = "1.2.840.113556.1.4.319";
 
-/// `caseIgnoreOrderingMatch` — the ordering rule census names for string sort keys.
+/// `caseIgnoreOrderingMatch` — the ordering rule census names for string sort keys
+/// (`uid`/`cn`), and the default for `[browse] sort_ordering` (config carries the
+/// literal to avoid a cross-module dependency; this const documents it and anchors the
+/// byte-exact control tests).
+#[allow(dead_code)]
 pub const CASE_IGNORE_ORDERING: &str = "2.5.13.3";
 
-/// A Server-Side Sort request sorting by a single string attribute, ascending or
-/// descending. The `orderingRule` is set **explicitly** to `caseIgnoreOrderingMatch`:
-/// OpenLDAP refuses to sort by an attribute (like `uid`) whose schema declares no
-/// ORDERING ("serverSort control: No ordering rule") unless one is named, and naming
-/// it is harmless on servers (e.g. 389-ds) that would otherwise default it. Sent
-/// non-critical — census only uses it once capability detection confirms SSS support.
+/// A Server-Side Sort request sorting by a single attribute, ascending or descending,
+/// naming an explicit `orderingRule` (its OID). Naming it is **required** on OpenLDAP,
+/// which refuses to sort by an attribute (like `uid`) whose schema declares no ORDERING
+/// ("serverSort control: No ordering rule"); it is also what selects the *right*
+/// comparison — [`CASE_IGNORE_ORDERING`] for a string key, integerOrderingMatch
+/// (`2.5.13.15`) for an integer key such as a precomputed `sortRank`. When a server
+/// has a VLV browsing index, this OID must match the one the index was built with, or
+/// the server falls back to an in-memory sort. Sent non-critical — census only uses it
+/// once capability detection confirms SSS support.
 ///
 /// `SortKeyList ::= SEQUENCE OF SEQUENCE { attributeType OCTET STRING,
 ///     orderingRule [0] OCTET STRING OPTIONAL, reverseOrder [1] BOOLEAN DEFAULT FALSE }`
-pub fn sort_control(attr: &str, reverse: bool) -> RawControl {
+pub fn sort_control(attr: &str, ordering: &str, reverse: bool) -> RawControl {
     let mut key = vec![
         Tag::OctetString(OctetString { inner: attr.as_bytes().to_vec(), ..Default::default() }),
-        // orderingRule [0] OCTET STRING — required by OpenLDAP for uid/cn.
+        // orderingRule [0] OCTET STRING — required by OpenLDAP for uid/cn; selects the
+        // integer vs. string comparison and must match the server's VLV index rule.
         Tag::OctetString(OctetString {
             id: 0,
             class: TagClass::Context,
-            inner: CASE_IGNORE_ORDERING.as_bytes().to_vec(),
+            inner: ordering.as_bytes().to_vec(),
         }),
     ];
     if reverse {
@@ -140,7 +148,7 @@ mod tests {
     #[test]
     fn ascending_uid_is_byte_exact() {
         // SEQUENCE { SEQUENCE { OCTETSTRING "uid", [0] OCTETSTRING "2.5.13.3" } }
-        let c = sort_control("uid", false);
+        let c = sort_control("uid", CASE_IGNORE_ORDERING, false);
         assert_eq!(c.ctype, SSS_OID);
         assert!(!c.crit);
         assert_eq!(
@@ -155,7 +163,7 @@ mod tests {
     #[test]
     fn descending_uid_appends_reverse_boolean() {
         // … same, plus [1] BOOLEAN true at the end.
-        let val = sort_control("uid", true).val.unwrap();
+        let val = sort_control("uid", CASE_IGNORE_ORDERING, true).val.unwrap();
         assert_eq!(
             &val[..21],
             &[
@@ -165,6 +173,23 @@ mod tests {
             ]
         );
         assert_ne!(val[21], 0x00); // BER TRUE (0x01 or 0xFF)
+    }
+
+    #[test]
+    fn integer_sortrank_names_its_ordering_rule() {
+        // A precomputed integer sort key (e.g. `sortRank`) must name
+        // integerOrderingMatch (2.5.13.15), not the string rule, so the server sorts
+        // numerically and matches a VLV index built the same way.
+        // SEQUENCE { SEQUENCE { OCTETSTRING "sortRank", [0] OCTETSTRING "2.5.13.15" } }
+        let c = sort_control("sortRank", "2.5.13.15", false);
+        assert_eq!(
+            c.val.unwrap(),
+            vec![
+                0x30, 0x17, 0x30, 0x15,
+                0x04, 0x08, b's', b'o', b'r', b't', b'R', b'a', b'n', b'k',
+                0x80, 0x09, b'2', b'.', b'5', b'.', b'1', b'3', b'.', b'1', b'5',
+            ]
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@ pub struct Config {
     pub tunnel: TunnelConfig,
     #[serde(default)]
     pub display: DisplayConfig,
+    #[serde(default)]
+    pub browse: BrowseConfig,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -62,8 +64,38 @@ pub struct DisplayConfig {
     pub allow_writes: bool,
 }
 
+/// How the user browse list is ordered, pushed to the server as Server-Side Sort +
+/// VLV. Defaults reproduce census's original behaviour (sort by `uid`, string
+/// ordering). On a directory that ships a **precomputed sort-key attribute** with a
+/// VLV browsing index — e.g. an integer `sortRank` giving surname-then-given order —
+/// point census at it here so its SSS/VLV names the *same* attribute and ordering
+/// rule the index was built with; that's what makes a million-entry ordered browse
+/// hit the index (fast) instead of an in-memory re-sort. Where the attribute is
+/// absent, leave the defaults and census sorts by `uid`.
+#[derive(Deserialize, Debug, Clone)]
+pub struct BrowseConfig {
+    /// Attribute the browse list is sorted by (default `uid`). Must be unique per
+    /// entry (it doubles as the paging key) and covered by the server's VLV index.
+    #[serde(default = "default_sort_attr")]
+    pub sort_attr: String,
+    /// The orderingRule OID census names in its SSS control — it must match the rule
+    /// the VLV index was built with, or the server won't use the index. Default is
+    /// `caseIgnoreOrderingMatch` (2.5.13.3) for string keys; use `2.5.13.15`
+    /// (integerOrderingMatch) for an integer key like `sortRank`.
+    #[serde(default = "default_sort_ordering")]
+    pub sort_ordering: String,
+}
+
+impl Default for BrowseConfig {
+    fn default() -> Self {
+        BrowseConfig { sort_attr: default_sort_attr(), sort_ordering: default_sort_ordering() }
+    }
+}
+
 fn default_port() -> u16 { 636 }
 fn default_true() -> bool { true }
+fn default_sort_attr() -> String { "uid".to_string() }
+fn default_sort_ordering() -> String { "2.5.13.3".to_string() }
 
 impl Config {
     pub fn load(path: Option<&PathBuf>) -> anyhow::Result<Self> {

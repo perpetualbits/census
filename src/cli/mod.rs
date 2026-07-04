@@ -663,6 +663,7 @@ mod tests {
             shell: "/bin/sh".into(),
             ssh_keys: vec![],
             photo: Some(vec![1, 2, 3]),
+            sort_key: String::new(),
             attrs: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&u).unwrap();
