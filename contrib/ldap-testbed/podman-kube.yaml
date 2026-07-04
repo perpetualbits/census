@@ -1,0 +1,85 @@
+# Run the test directory as a pod with `podman kube play`. This manifest is also
+# a starting point for real Kubernetes (see the "Kubernetes / Helm" section of
+# docs/openldap-testbed.md).
+#
+#   # build the images first (kube play does not build):
+#   podman build -t localhost/census-ldap:latest -f Containerfile .
+#   podman build -t localhost/census-ldap-generator:latest -f Containerfile.generator .
+#   podman kube play podman-kube.yaml
+#   # tear down:
+#   podman kube down podman-kube.yaml
+#
+# The generator runs as an initContainer (writes the corpus into the shared
+# volume and exits); the slapd container then self-seeds and serves.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: census-seed
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: census-conf
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: census-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 16Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: census-ldap
+  labels:
+    app: census-ldap
+spec:
+  restartPolicy: Always
+  initContainers:
+    - name: generator
+      image: localhost/census-ldap-generator:latest
+      # Bump these for the full 2000000 / 3000 / 300 corpus.
+      args:
+        - --users
+        - "100000"
+        - --groups
+        - "1000"
+        - --ssh-users
+        - "200"
+        - --out
+        - /seed/data.ldif
+        - --ssh-out
+        - /seed/ssh.ldif
+      volumeMounts:
+        - { name: seed, mountPath: /seed }
+  containers:
+    - name: slapd
+      image: localhost/census-ldap:latest
+      env:
+        - { name: BASE_DN, value: "dc=census,dc=test" }
+        - { name: ADMIN_PW, value: "census" }
+      ports:
+        - { containerPort: 389, hostPort: 3389 }
+      volumeMounts:
+        - { name: seed, mountPath: /seed }
+        - { name: conf, mountPath: /etc/ldap/slapd.d }
+        - { name: data, mountPath: /var/lib/ldap }
+  volumes:
+    - { name: seed, persistentVolumeClaim: { claimName: census-seed } }
+    - { name: conf, persistentVolumeClaim: { claimName: census-conf } }
+    - { name: data, persistentVolumeClaim: { claimName: census-data } }

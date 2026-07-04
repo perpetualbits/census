@@ -1,0 +1,27 @@
+# census config for the local OpenLDAP test directory.
+# Copy to ~/.config/census/census-test.toml and run:
+#   census --config ~/.config/census/census-test.toml --ping
+
+[server]
+host         = "localhost"
+port         = 3389
+use_ssl      = false          # plain LDAP — local throwaway server
+start_tls    = false
+base_dn      = "dc=census,dc=test"
+bind_dn      = "cn=admin,dc=census,dc=test"
+password_cmd = "printf census"  # admin password is 'census'
+verify       = false
+
+[tunnel]
+enabled = false
+
+[browse]
+# This corpus ships a precomputed integer `sortRank` (0..N-1, surname-then-given
+# order) with a VLV browsing index, so an ordered million-entry browse hits the
+# index instead of an in-memory re-sort. Point census at it (integerOrderingMatch,
+# so the SSS control matches the index the rank was built with).
+sort_attr     = "sortRank"
+sort_ordering = "2.5.13.15"     # integerOrderingMatch
+
+[display]
+allow_writes = false            # pass --write on the CLI to enable modifications

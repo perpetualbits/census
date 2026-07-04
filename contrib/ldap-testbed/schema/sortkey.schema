@@ -1,0 +1,23 @@
+# Pre-normalized sort key + integer rank for fast server-side sorting / VLV.
+#
+# The corpus stores entries physically in name order and gives each user an
+# integer `sortRank` (0..N-1) equal to that order. Sorting 2M *strings* costs
+# ~8s (copying the values dominates); sorting a small INTEGER whose index order
+# matches on-disk order is a sequential scan (~4.5s, the bare gather floor).
+#
+# OID arc 1.3.6.1.4.1.4203.666 = OpenLDAP experimental (fine for a test server).
+attributetype ( 1.3.6.1.4.1.4203.666.1.100 NAME 'sortKey'
+    DESC 'Pre-normalized (lowercased, ASCII-folded) surname/given sort key'
+    EQUALITY octetStringMatch
+    ORDERING octetStringOrderingMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 SINGLE-VALUE )
+
+attributetype ( 1.3.6.1.4.1.4203.666.1.102 NAME 'sortRank'
+    DESC 'Precomputed global name-order rank for fast integer SSS/VLV'
+    EQUALITY integerMatch
+    ORDERING integerOrderingMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+
+objectclass ( 1.3.6.1.4.1.4203.666.1.101 NAME 'sortable' AUXILIARY
+    DESC 'Carries a sortKey / sortRank for fast ordered browse'
+    MAY ( sortKey $ sortRank ) )

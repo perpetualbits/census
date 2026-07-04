@@ -1,0 +1,14 @@
+# Corpus generator: runs gen.py (Faker names + real ssh-keygen keys) and writes
+# /seed/data.ldif + /seed/ssh.ldif, then a /seed/.done marker the server waits on.
+FROM python:3.12-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-client \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip install --no-cache-dir faker
+
+COPY gen.py /usr/local/bin/gen.py
+
+# Args are passed at run time (--users/--groups/--ssh-users/--out/--ssh-out).
+# The wrapper drops a .done marker so the server knows generation finished.
+ENTRYPOINT ["/bin/sh", "-c", "python /usr/local/bin/gen.py \"$@\" && touch /seed/.done", "--"]

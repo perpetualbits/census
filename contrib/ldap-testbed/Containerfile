@@ -1,0 +1,18 @@
+# OpenLDAP (slapd) server, self-seeding from a generated LDIF corpus.
+# Builds with either `podman build` or `docker build -f Containerfile`.
+FROM debian:trixie-slim
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      slapd ldap-utils \
+ && rm -rf /var/lib/apt/lists/* \
+ && rm -rf /etc/ldap/slapd.d/* /var/lib/ldap/*
+
+# Static config + schema baked in; the generated LDIF arrives on a volume at /seed.
+COPY slapd.conf /etc/census/slapd.conf
+COPY schema/ /etc/census/schema/
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 389
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

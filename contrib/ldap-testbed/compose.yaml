@@ -1,0 +1,54 @@
+# Podman/Docker Compose for the census OpenLDAP test directory.
+#
+#   podman compose up -d          (or: podman-compose up -d / docker compose up -d)
+#   podman compose logs -f ldap   # watch it generate + bulk-load + apply ssh keys
+#
+# Scale is set in .env (copy .env.example). The default here is a quick 100k-user
+# corpus; set USERS=2000000 GROUPS=3000 SSH_USERS=300 for the full build.
+#
+# The `generator` service writes the LDIF into the shared `seed` volume and exits;
+# `ldap` waits for it (both via depends_on and by polling /seed/.done in its
+# entrypoint, so it also works on engines that ignore the completion condition).
+
+services:
+  generator:
+    build:
+      context: .
+      dockerfile: Containerfile.generator
+    command:
+      - --users
+      - "${USERS:-100000}"
+      - --groups
+      - "${GROUPS:-1000}"
+      - --ssh-users
+      - "${SSH_USERS:-200}"
+      - --out
+      - /seed/data.ldif
+      - --ssh-out
+      - /seed/ssh.ldif
+    volumes:
+      - seed:/seed
+    restart: "no"
+
+  ldap:
+    build:
+      context: .
+      dockerfile: Containerfile
+    depends_on:
+      generator:
+        condition: service_completed_successfully
+    environment:
+      BASE_DN: dc=census,dc=test
+      ADMIN_PW: census
+    ports:
+      - "${PORT:-3389}:389"
+    volumes:
+      - seed:/seed
+      - conf:/etc/ldap/slapd.d
+      - data:/var/lib/ldap
+    restart: unless-stopped
+
+volumes:
+  seed:
+  conf:
+  data:
