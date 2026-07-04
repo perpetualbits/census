@@ -68,32 +68,32 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, focus: Pane) {
 
 fn render_list(app: &App, buf: &mut Buffer, area: Rect, focused: bool) {
     let hs   = if focused { s_head() } else { s_subhead() };
-    let list = app.user_list();
-    // The list is windowed over the directory — the total is unknown, so show the
-    // window ("N shown", `+` when more exist below), not a (misleading) count.
-    let more = if list.at_top() && list.at_bottom() { "" } else { "+" };
-    let mut label = format!("users ({}{more} shown)", list.visible().len());
-    // On a server without Server-Side Sort the browse is a capped, client-sorted
-    // window — say so, since you can't page the whole (millions-row) set in order.
+    let snap = app.browse();
+    let both_ends = snap.at_top && snap.at_bottom;
+    // Windowed over the directory — show the window ("N shown", `+` when more exist),
+    // not a (misleading) total, plus the async loading / fallback / error state.
+    let more = if both_ends { "" } else { "+" };
+    let mut label = format!("users ({}{more} shown)", snap.rows.len());
+    if app.browse_loading() { label.push_str(" · loading…"); }
     if !app.browse_keyset() { label.push_str(" · capped (no server sort)"); }
     if app.browse_err() { label.push_str(" — browse error"); }
     ColumnGrid::write_text(buf, area, area.y, &label, Align::Start, hs);
     hline(buf, Rect::new(area.x, area.y + 1, area.width, 1));
 
     let data = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(2));
-    // Estimated scrollbar in the rightmost column unless the whole set is on screen.
-    let content = if !(list.at_top() && list.at_bottom()) && data.width >= 2 {
+    // Scrollbar in the rightmost column unless the whole set is on screen.
+    let content = if !both_ends && data.width >= 2 {
         let bar = Rect::new(data.x + data.width - 1, data.y, 1, data.height);
-        render_scrollbar(buf, bar, app.user_metrics(), s_dim());
+        render_scrollbar(buf, bar, snap.metrics, s_dim());
         Rect::new(data.x, data.y, data.width - 1, data.height)
     } else {
         data
     };
     let cols = list_grid().resolve(content);
 
-    for (row, user) in list.visible().iter().enumerate() {
+    for (row, user) in snap.rows.iter().enumerate() {
         let y   = content.y + row as u16;
-        let sel = list.selected_visible_row() == Some(row);
+        let sel = snap.selected == Some(row);
         let sty = if sel { s_sel() } else if focused { s_normal() } else { s_dim() };
         if sel { fill_row(buf, content.x, y, content.width, sty); }
         ColumnGrid::write_text(buf, cols[0], y, &user.uid, Align::Start, sty);

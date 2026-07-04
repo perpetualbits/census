@@ -1,19 +1,18 @@
 //! TUI orchestrator: application state, event loop, key routing, render dispatch.
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, MouseEventKind};
 use mullion::{
-    backend::CrosstermBackend, Buffer, EventReader, KeyCode, KeyModifiers, Rect, ScrollMetrics,
-    Terminal, VirtualList,
+    backend::CrosstermBackend, Buffer, EventReader, KeyCode, KeyModifiers, Rect, Terminal,
 };
 
+use crate::config::Config;
 use crate::ldap::client::{DitNode, Group, User};
-use crate::ldap::source::UserSource;
 use crate::session::Session;
+
+use super::browse::Browse;
 
 use super::focus::{ListCursor, Pane};
 use super::glow;
@@ -66,11 +65,9 @@ pub struct App {
 
     pub groups_cur: ListCursor,
 
-    // Browse screen — the user list is windowed over the directory via a keyset
-    // VirtualList, so it scales to millions of entries without loading them.
-    user_list: VirtualList<UserSource>,
-    user_metrics: ScrollMetrics,
-    browse_err: Rc<Cell<bool>>,
+    // Browse screen — the windowed user list runs on a background thread (browse.rs)
+    // so a slow server fetch never blocks the UI; here we hold the latest snapshot.
+    browse: Browse,
 
     // Browse screen.
     pub browse_focus: Pane,
@@ -123,19 +120,12 @@ pub struct App {
 }
 
 impl App {
-    fn new(sessions: Vec<Session>, write_mode: bool, dry_run: bool) -> Self {
-        // Window the browse list over a dedicated source before `sessions` moves in.
-        let browse_err = Rc::new(Cell::new(false));
-        let user_list = VirtualList::new(
-            UserSource::new(sessions[0].browse.clone(), browse_err.clone(), sessions[0].caps.vlv),
-            20,  // placeholder viewport; set_viewport() tracks the real body height each frame
-            64,  // fetch batch
-        );
+    fn new(sessions: Vec<Session>, write_mode: bool, dry_run: bool, cfg: Config, password: Option<String>) -> Self {
+        // The browse list runs on its own thread with its own read-only connection.
+        let browse = Browse::spawn(cfg, password, 20);
         Self {
             sessions, active: 0, mode: Mode::Browse,
-            user_list,
-            user_metrics: ScrollMetrics::from_window(0, 0, 0),
-            browse_err,
+            browse,
             groups_cur: ListCursor::new(),
             browse_focus: Pane::Left,
             detail_scroll: 0,
@@ -399,30 +389,24 @@ impl App {
 
     /// The uid under the browse cursor, if any.
     fn cursor_uid(&self) -> Option<String> {
-        self.user_list.selected().map(|u| u.uid.clone())
+        self.browse.selected_uid()
     }
 
-    /// The windowed browse list (users), for the browse screen render.
-    pub fn user_list(&self) -> &VirtualList<UserSource> { &self.user_list }
-    /// Estimated scrollbar metrics for the browse list (computed in update_offsets).
-    pub fn user_metrics(&self) -> ScrollMetrics { self.user_metrics }
-    /// Whether a browse fetch has errored this session (surfaced in the header).
-    pub fn browse_err(&self) -> bool { self.browse_err.get() }
-    /// Whether the browse is true server-sorted keyset paging (scales to millions)
-    /// vs. the capped client-sorted fallback used when the server lacks SSS.
+    /// The latest browse snapshot (rows / selection / scrollbar) for the screen.
+    pub fn browse(&self) -> &super::browse::Snapshot { &self.browse.snapshot }
+    /// Whether a browse fetch is in flight (drives the `loading…` hint).
+    pub fn browse_loading(&self) -> bool { self.browse.loading }
+    /// Whether the last browse fetch errored (surfaced in the header).
+    pub fn browse_err(&self) -> bool { self.browse.snapshot.err }
+    /// Whether the browse is true server-sorted (VLV) paging (scales to millions)
+    /// vs. the capped client-sorted fallback used when the server lacks it.
     pub fn browse_keyset(&self) -> bool { self.session().caps.vlv }
 
-    /// Rebuild the browse list from the directory (after a write), preserving the
-    /// selected uid — mullion's `VirtualList` has no in-place refresh.
+    /// Refresh the browse list after a write, preserving the selected uid (the
+    /// worker rebuilds; there is no in-place refresh).
     fn rebuild_user_list(&mut self) {
-        let keep = self.user_list.selected_key().cloned();
-        let vp = self.user_list.viewport();
-        let sss = self.session().caps.vlv;
-        let src = UserSource::new(self.session().browse.clone(), self.browse_err.clone(), sss);
-        self.user_list = VirtualList::new(src, vp, 64);
-        if let Some(k) = keep {
-            self.user_list.select_key(&k);
-        }
+        let keep = self.browse.selected_uid();
+        self.browse.rebuild(keep);
     }
 
     /// Fetch the full record for the cursored user if it isn't already loaded.
@@ -440,9 +424,8 @@ impl App {
 
 // ─── entry point ─────────────────────────────────────────────────────────────
 
-pub fn run(sessions: Vec<Session>, write_mode: bool, dry_run: bool) -> anyhow::Result<()> {
-    let mut app = App::new(sessions, write_mode, dry_run);
-    app.ensure_detail_loaded();
+pub fn run(sessions: Vec<Session>, write_mode: bool, dry_run: bool, cfg: Config, password: Option<String>) -> anyhow::Result<()> {
+    let mut app = App::new(sessions, write_mode, dry_run, cfg, password);
     if dry_run {
         app.status = Some(("dry-run: writes are simulated, nothing is sent".into(), false));
     }
@@ -469,6 +452,12 @@ fn main_loop(
     // burst of keys is consumed in one frame and never blocked by a slow draw.
     let input = EventReader::new();
     loop {
+        // Pick up any browse window the worker produced (non-blocking); load the
+        // detail of whatever is now selected (no-op if unchanged).
+        app.browse.poll();
+        if app.mode == Mode::Browse {
+            app.ensure_detail_loaded();
+        }
         // Fire the debounced server search once typing has settled (never per keystroke).
         app.tick_search();
         term.draw(|buf| {
@@ -535,8 +524,7 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind) {
     match app.mode {
         Mode::Browse => match app.browse_focus {
             Pane::Left => {
-                if down { app.user_list.select_next(); } else { app.user_list.select_prev(); }
-                app.ensure_detail_loaded();
+                if down { app.browse.select_next(); } else { app.browse.select_prev(); }
             }
             Pane::Right => {
                 app.detail_scroll = if down {
@@ -581,8 +569,7 @@ fn update_offsets(app: &mut App, area: Rect) {
     let nusers = app.users().len();
     let ngroups = app.groups().len();
     // Browse list: track the body height, then read its (estimated) scrollbar.
-    app.user_list.set_viewport(vis);
-    app.user_metrics = app.user_list.scroll_metrics();
+    app.browse.set_viewport(vis);
     app.groups_cur.keep_in_view(ngroups, vis);
     app.left_cur.keep_in_view(nusers, vis);
 
@@ -718,10 +705,10 @@ fn handle_key(
                     if app.browse_focus == Pane::Left { Pane::Right } else { Pane::Left };
             }
             // Left pane: navigate the windowed user list (reloads the detail record).
-            (Pane::Left, Up   | Char('k')) => { app.user_list.select_prev(); app.ensure_detail_loaded(); }
-            (Pane::Left, Down | Char('j')) => { app.user_list.select_next(); app.ensure_detail_loaded(); }
-            (Pane::Left, PageUp)   => { let v = app.user_list.viewport() as isize; app.user_list.select_page(-v); app.ensure_detail_loaded(); }
-            (Pane::Left, PageDown) => { let v = app.user_list.viewport() as isize; app.user_list.select_page(v);  app.ensure_detail_loaded(); }
+            (Pane::Left, Up   | Char('k')) => app.browse.select_prev(),
+            (Pane::Left, Down | Char('j')) => app.browse.select_next(),
+            (Pane::Left, PageUp)   => app.browse.page_up(),
+            (Pane::Left, PageDown) => app.browse.page_down(),
             // Right pane: move the editable-attribute cursor.
             (Pane::Right, Up   | Char('k')) => { app.detail_cur = app.detail_cur.saturating_sub(1); }
             (Pane::Right, Down | Char('j')) => {
@@ -978,7 +965,7 @@ fn open_delete_user(app: &mut App) {
         app.status = Some(("Read-only — pass --write to modify".into(), true));
         return;
     }
-    let Some(user) = app.user_list.selected() else { return; };
+    let Some(user) = app.browse.snapshot.selected_user() else { return; };
     let dn  = user.dn.clone();
     let uid = user.uid.clone();
     let prompt = format!("Delete user {uid}? Irreversible.");
@@ -1380,7 +1367,7 @@ impl App {
 
     /// Jump the browse cursor to `uid` (seeking the server if needed) and load detail.
     fn select_user(&mut self, uid: &str) {
-        self.user_list.select_key(&uid.to_string());
+        self.browse.select_key(uid);
         self.load_detail(None);
         self.ensure_detail_loaded();
     }

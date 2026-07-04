@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let session = Session::connect(&cfg, password.as_deref(), pw_source, "(default)".into())?;
-    tui::run(vec![session], allow_writes, args.dry_run)
+    tui::run(vec![session], allow_writes, args.dry_run, cfg, password)
 }
 
 fn get_password(cfg: &Config) -> (Option<String>, conninfo::PwSource) {

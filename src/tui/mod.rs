@@ -1,4 +1,5 @@
 pub mod app;
+pub mod browse;
 pub mod draw;
 pub mod focus;
 pub mod glow;
