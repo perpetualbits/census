@@ -447,14 +447,20 @@ impl LdapClient {
     /// Read the server's schema — every `attributeTypes` and `objectClasses`
     /// definition from the subschema entry (found via the rootDSE's
     /// `subschemaSubentry`). Read-only; works on every brand. Sorted by name.
-    pub fn read_schema(&mut self) -> anyhow::Result<Vec<SchemaElem>> {
-        let sub_dn = self.conn
+    /// The subschema entry's DN, from the rootDSE `subschemaSubentry` (e.g. `cn=schema`
+    /// on 389-DS, `cn=Subschema` on OpenLDAP).
+    fn subschema_dn(&mut self) -> anyhow::Result<String> {
+        Ok(self.conn
             .search("", Scope::Base, "(objectClass=*)", vec!["subschemaSubentry"])
             .context("rootDSE read")?
             .success().context("rootDSE rejected")?
             .0.into_iter().next().map(SearchEntry::construct)
             .and_then(|e| e.attrs.get("subschemaSubentry").and_then(|v| v.first()).cloned())
-            .unwrap_or_else(|| "cn=subschema".to_string());
+            .unwrap_or_else(|| "cn=subschema".to_string()))
+    }
+
+    pub fn read_schema(&mut self) -> anyhow::Result<Vec<SchemaElem>> {
+        let sub_dn = self.subschema_dn()?;
 
         let entry = self.conn
             .search(&sub_dn, Scope::Base, "(objectClass=*)", vec!["attributeTypes", "objectClasses"])
@@ -472,6 +478,30 @@ impl LdapClient {
         }
         out.sort_by_key(|e| e.name.to_lowercase());
         Ok(out)
+    }
+
+    /// Add a schema element — an `attributeTypes` or `objectClasses` definition — to
+    /// the subschema entry. **389-DS only** (the Directory Manager can modify
+    /// `cn=schema`); OpenLDAP keeps schema under `cn=config`, unreachable over the data
+    /// connection. `definition` is the full RFC 4512 string; the server validates it.
+    pub fn add_schema(&mut self, kind: SchemaKind, definition: &str) -> anyhow::Result<()> {
+        if self.brand != Brand::Ds389 {
+            anyhow::bail!(
+                "adding schema over LDAP needs 389 Directory Server (this is {}); \
+                 OpenLDAP schema lives under cn=config, which the data connection can't reach",
+                self.brand.label()
+            );
+        }
+        let attr = match kind {
+            SchemaKind::Attribute => "attributeTypes",
+            SchemaKind::ObjectClass => "objectClasses",
+        };
+        let dn = self.subschema_dn()?;
+        self.conn
+            .modify(&dn, vec![Mod::Add(attr, HashSet::from([definition.trim()]))])
+            .context("schema modify")?
+            .success().context("schema modify rejected")?;
+        Ok(())
     }
 
     /// How this client reached the directory (direct vs SSH tunnel), for the UI.

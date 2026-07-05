@@ -9,7 +9,7 @@ use mullion::{
 };
 
 use crate::config::ConnMode;
-use crate::ldap::client::{Brand, DitNode, Group, SchemaElem, User};
+use crate::ldap::client::{Brand, DitNode, Group, SchemaElem, SchemaKind, User};
 use crate::session::Session;
 
 use super::backup::Backups;
@@ -138,6 +138,7 @@ pub struct App {
     schema_filtering: bool,     // typing edits the filter (started with `/`)
     schema_from: Mode,          // mode to return to on Esc
     schema_title: String,       // "<server> (<brand>)"
+    schema_session: usize,      // the session the schema was read from (for add)
 
     // DIT tree browser.
     pub dit_focus: Pane,
@@ -210,6 +211,7 @@ impl App {
             schema_filtering: false,
             schema_from: Mode::Browse,
             schema_title: String::new(),
+            schema_session: 0,
             dit_focus: Pane::Left,
             dit_cur: ListCursor::new(),
             dit_detail_cur: 0,
@@ -535,6 +537,7 @@ impl App {
                 self.schema_filtering = false;
                 let s = &self.sessions[session_idx];
                 self.schema_title = format!("{} ({})", s.server_label, s.client.brand().label());
+                self.schema_session = session_idx;
                 self.schema_from = self.mode;
                 self.mode = Mode::Schema;
                 self.rail_focused = false; // hand key focus to the schema workspace
@@ -561,6 +564,43 @@ impl App {
     pub fn schema_filter(&self) -> &str { &self.schema_filter }
     pub fn schema_filtering(&self) -> bool { self.schema_filtering }
     pub fn schema_title(&self) -> &str { &self.schema_title }
+
+    /// a / o: prompt to add an attributeType / objectClass (389-DS + Write).
+    fn open_add_schema(&mut self, kind: SchemaKind) {
+        let idx = self.schema_session;
+        if idx >= self.sessions.len() { return; }
+        let s = &self.sessions[idx];
+        if s.client.brand() != Brand::Ds389 {
+            self.status = Some((format!(
+                "adding schema over LDAP needs 389-DS (this server is {})", s.client.brand().label()), true));
+            return;
+        }
+        if s.mode != ConnMode::Write {
+            self.status = Some(("set this connection to write (M in the rail) to add schema".into(), true));
+            return;
+        }
+        self.overlay = Some(Overlay::Input(overlay::InputDialog::new_schema(idx, kind)));
+    }
+
+    /// Add a schema definition to `session_idx`'s server, then refresh the browser.
+    fn do_add_schema(&mut self, session_idx: usize, kind: SchemaKind, definition: &str) {
+        if session_idx >= self.sessions.len() || self.sessions[session_idx].mode != ConnMode::Write {
+            self.status = Some(("connection is read-only".into(), true));
+            return;
+        }
+        match self.sessions[session_idx].client.add_schema(kind, definition) {
+            Ok(()) => {
+                if self.mode == Mode::Schema && self.schema_session == session_idx {
+                    if let Ok(elems) = self.sessions[session_idx].client.read_schema() {
+                        self.schema_elems = elems;
+                    }
+                }
+                let what = match kind { SchemaKind::Attribute => "attributeType", SchemaKind::ObjectClass => "objectClass" };
+                self.status = Some((format!("added {what}"), false));
+            }
+            Err(e) => self.status = Some((format!("add schema failed: {e:#}"), true)),
+        }
+    }
 
     /// Rebuild the flattened rail: each server group (in first-seen order) followed by
     /// its domain leaves when expanded. Mirrors [`Self::rebuild_dit_rows`].
@@ -943,6 +983,10 @@ fn handle_paste(app: &mut App, text: String) -> anyhow::Result<bool> {
                 app.overlay = None;
                 app.do_delete_domain(session_idx);
             }
+            OverlayResult::AddSchema { session_idx, kind, definition } => {
+                app.overlay = None;
+                app.do_add_schema(session_idx, kind, &definition);
+            }
         }
         return Ok(false);
     }
@@ -1150,6 +1194,10 @@ fn handle_key(
             OverlayResult::DeleteDomain { session_idx } => {
                 app.overlay = None;
                 app.do_delete_domain(session_idx);
+            }
+            OverlayResult::AddSchema { session_idx, kind, definition } => {
+                app.overlay = None;
+                app.do_add_schema(session_idx, kind, &definition);
             }
         }
         return Ok(false);
@@ -1366,6 +1414,8 @@ fn handle_key(
                     (_, Char('q')) => return Ok(true),
                     (_, Esc) => app.mode = app.schema_from,
                     (_, Char('/')) => app.schema_filtering = true,
+                    (_, Char('a')) => app.open_add_schema(SchemaKind::Attribute),
+                    (_, Char('o')) => app.open_add_schema(SchemaKind::ObjectClass),
                     (_, Tab) | (_, BackTab) =>
                         app.schema_focus = if app.schema_focus == Pane::Left { Pane::Right } else { Pane::Left },
                     (Pane::Left, Up   | Char('k')) => app.schema_cur.up(),

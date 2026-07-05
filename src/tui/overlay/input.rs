@@ -18,6 +18,8 @@ enum Target {
     Rename { dn: String, old_name: String },
     /// Create a new domain (naming context) on the server of session `template_idx`.
     NewDomain { template_idx: usize },
+    /// Add a schema definition (`kind`) to the server of session `session_idx`.
+    NewSchema { session_idx: usize, kind: crate::ldap::client::SchemaKind },
 }
 
 /// A one-line text editor rendered as a centred modal box. The text buffer and
@@ -79,6 +81,32 @@ impl InputDialog {
         }
     }
 
+    /// Prompt for a new schema definition (RFC 4512), pre-filled with a skeleton for
+    /// `kind`, to add to the server of session `session_idx`.
+    pub fn new_schema(session_idx: usize, kind: crate::ldap::client::SchemaKind) -> Self {
+        use crate::ldap::client::SchemaKind;
+        let (title, value) = match kind {
+            SchemaKind::Attribute => (
+                "add attributeType",
+                "( 1.3.6.1.4.1.99999.1.1 NAME 'myAttr' DESC '' SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )",
+            ),
+            SchemaKind::ObjectClass => (
+                "add objectClass",
+                "( 1.3.6.1.4.1.99999.2.1 NAME 'myClass' DESC '' SUP top AUXILIARY MUST () MAY () )",
+            ),
+        };
+        let value = value.to_string();
+        Self {
+            title: title.into(),
+            label: "definition (RFC 4512)".into(),
+            cursor: value.len(),
+            value,
+            masked: false,
+            ctx: TextCtx::LTR, // schema definitions are ASCII/LTR
+            target: Target::NewSchema { session_idx, kind },
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyCode, _mods: KeyModifiers) -> OverlayResult {
         use KeyCode::*;
         match key {
@@ -109,6 +137,13 @@ impl InputDialog {
                             OverlayResult::Cancel
                         } else {
                             OverlayResult::CreateDomain { template_idx: *template_idx, suffix: value }
+                        }
+                    }
+                    Target::NewSchema { session_idx, kind } => {
+                        if value.trim().is_empty() {
+                            OverlayResult::Cancel
+                        } else {
+                            OverlayResult::AddSchema { session_idx: *session_idx, kind: *kind, definition: value }
                         }
                     }
                 }

@@ -36,6 +36,7 @@ const MANUAL: &[&str] = &[
     "  N              create a new domain on this server (389-DS; connection must be write)",
     "  D              delete the cursored domain (389-DS; type the suffix to confirm)",
     "  s              browse this server's schema (attributeTypes / objectClasses)",
+    "                 (in the schema view: / filter, a/o add an attr/class — 389-DS + write)",
     "",
     "# Search  (/)",
     "  Type to filter users and groups live; matches come from first/last name,",

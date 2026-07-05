@@ -38,7 +38,7 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect) {
             btxt(buf, area.x + 2, bottom, &format!(" {msg} "), if *is_err { s_err() } else { s_ok() }),
         None => {
             let pairs: &[(&str, &str)] = &[("jk", "nav"), ("/", "filter"), ("Tab", "defn"),
-                                           ("Esc", "back"), ("q", "quit")];
+                                           ("a/o", "add attr/class"), ("Esc", "back"), ("q", "quit")];
             keyhints(buf, area.x + 2, bottom, area.width.saturating_sub(4), pairs);
         }
     }

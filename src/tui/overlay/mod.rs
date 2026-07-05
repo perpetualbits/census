@@ -82,6 +82,9 @@ pub enum OverlayResult {
     /// Close the modal and delete the domain that session `session_idx` is connected
     /// to, then drop that session from the rail.
     DeleteDomain { session_idx: usize },
+    /// Close the modal and add a schema definition (`kind`, an RFC 4512 string) to the
+    /// server of session `session_idx`.
+    AddSchema { session_idx: usize, kind: crate::ldap::client::SchemaKind, definition: String },
 }
 
 /// The set of modal dialogs. One is active at a time via `App::overlay`.
