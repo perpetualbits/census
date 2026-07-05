@@ -78,6 +78,8 @@ const MANUAL: &[&str] = &[
     "  Enter          manage the group's membership (from the list)",
     "  n              create a new group",
     "  D              delete the selected group (type its DN to confirm)",
+    "  C              copy the selected group to the marked connection(s) — like the",
+    "                 user copy; memberUid values carry over as-is, the DN is rebased.",
     "  a              remove the group's extra cn (an 'aka' alias/name)",
     "  Duplicate names/gidNumbers are flagged in amber with a ⚠ marker.",
     "",

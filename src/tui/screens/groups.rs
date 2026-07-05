@@ -53,14 +53,18 @@ pub fn render_select(app: &App, buf: &mut Buffer, area: Rect) {
                  if *is_err { s_err() } else { s_ok() });
         }
         None => {
-            let pairs: &[(&str, &str)] = if focus == Pane::Right {
-                &[("Tab", "list"), ("jk", "attr"), ("e", "edit"), ("E", "big-edit"), ("r", "rename"),
+            let mut pairs: Vec<(&str, &str)> = if focus == Pane::Right {
+                vec![("Tab", "list"), ("jk", "attr"), ("e", "edit"), ("E", "big-edit"), ("r", "rename"),
                   ("a", "del-alias"), ("u", "undo"), ("?", "help"), ("Esc", "")]
             } else {
-                &[("Tab", "detail"), ("jk", ""), ("/", "search"), ("Enter", "members"), ("n", "new"),
+                vec![("Tab", "detail"), ("jk", ""), ("/", "search"), ("Enter", "members"), ("n", "new"),
                   ("D", "del"), ("a", "alias"), ("u", "undo"), ("L", "ldif"), ("?", "help"), ("Esc", "")]
             };
-            keyhints(buf, area.x + 2, bottom, area.width.saturating_sub(4), pairs);
+            // Copy-to-marked only makes sense with more than one connection loaded.
+            if focus != Pane::Right && app.session_count() > 1 {
+                pairs.insert(6, ("C", "copy→marked"));
+            }
+            keyhints(buf, area.x + 2, bottom, area.width.saturating_sub(4), &pairs);
         }
     }
 

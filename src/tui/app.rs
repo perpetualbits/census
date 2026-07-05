@@ -620,12 +620,29 @@ impl App {
     /// C (browse): copy the selected user from the focused connection (source) to the
     /// marked, writable connections (targets), rebasing its DN onto each target's base.
     /// Shows a review confirm first.
+    /// C (user browse): copy the selected user to the marked connections.
     fn prepare_migration(&mut self) {
-        let Some(user) = self.browse.snapshot.selected_user() else {
+        let Some((dn, label)) = self.browse.snapshot.selected_user().map(|u| (u.dn.clone(), u.uid.clone())) else {
             self.status = Some(("no user selected to copy".into(), true));
             return;
         };
-        let (dn, label) = (user.dn.clone(), user.uid.clone());
+        self.prepare_migration_of(dn, label);
+    }
+
+    /// C (group browse): copy the cursored group to the marked connections. A posixGroup's
+    /// `memberUid` values are bare uids (not DNs), so they carry over verbatim; only the
+    /// group's own DN is rebased onto each target's base-DN.
+    fn prepare_group_migration(&mut self) {
+        let Some((dn, label)) = self.groups().get(self.groups_cur.cursor).map(|g| (g.dn.clone(), g.name.clone())) else {
+            self.status = Some(("no group selected to copy".into(), true));
+            return;
+        };
+        self.prepare_migration_of(dn, label);
+    }
+
+    /// Shared migration setup: gather the writable marked targets (excluding the source),
+    /// build the review prompt, and stash a [`MigrationPlan`] for [`run_migration`].
+    fn prepare_migration_of(&mut self, dn: String, label: String) {
         let source = self.focused;
         let mut targets: Vec<usize> = self.marked.iter().copied()
             .filter(|&t| t != source && t < self.sessions.len() && self.sessions[t].mode.can_write())
@@ -1572,6 +1589,7 @@ fn handle_key(
             // Actions valid from either pane (operate on the cursored group).
             (_, Char('n')) => open_new_group(app),
             (_, Char('D')) => open_delete_group(app),
+            (_, Char('C')) => app.prepare_group_migration(),
             (_, Char('a')) => open_remove_alias(app),
             (_, Char('r')) => open_rename_group(app),
             // Left pane: navigate the group list.
