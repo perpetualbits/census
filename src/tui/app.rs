@@ -9,6 +9,8 @@ use mullion::{
 };
 
 use crate::config::ConnMode;
+use anyhow::Context;
+
 use crate::ldap::client::{Brand, DitNode, Group, LdapClient, SchemaElem, SchemaKind, User};
 use crate::session::Session;
 
@@ -87,6 +89,16 @@ pub struct RailRow {
     pub is_server: bool,
 }
 
+/// A pending host-provisioning operation for an OpenLDAP domain: the filesystem step
+/// (create/remove the backend's directory) runs via the server's `provision_cmd`, then
+/// census does the `cn=config` LDAP steps. Held until the operator confirms the review.
+struct ProvisionPlan {
+    session_idx: usize, // a session on the target server (its cfg + creds)
+    suffix: String,
+    dir: String,        // the backend's on-disk directory
+    fs_script: String,  // the mkdir+chown to run on the host
+}
+
 pub struct App {
     sessions: Vec<Session>,
     /// The connection whose data fills the workspace (its browse/DIT/detail live in the
@@ -105,6 +117,8 @@ pub struct App {
     rail_rows: Vec<RailRow>,
     /// A mode change awaiting confirmation: `(session index, new mode)`.
     pending_mode: Option<(usize, ConnMode)>,
+    /// A host-provisioning plan awaiting the operator's review/confirmation.
+    pending_provision: Option<ProvisionPlan>,
     /// In-flight domain backups (LDIF export) running on background threads.
     backups: Backups,
     mode:     Mode,
@@ -193,6 +207,7 @@ impl App {
             rail_expanded: HashSet::new(),
             rail_rows: Vec::new(),
             pending_mode: None,
+            pending_provision: None,
             backups: Backups::new(),
             browse, browse_sort_attr,
             groups_cur: ListCursor::new(),
@@ -414,17 +429,21 @@ impl App {
         self.sessions.iter().position(|s| s.server_label == row.label)
     }
 
-    /// N: prompt to create a new domain on the cursored server (389-DS + Write only).
+    /// N: prompt to create a new domain on the cursored server. 389-DS or OpenLDAP
+    /// (the latter needs config_bind_dn + provision_cmd), Write mode.
     fn rail_new_domain(&mut self) {
         let Some(idx) = self.rail_template_session() else {
             self.status = Some(("no connection here to create a domain on".into(), true));
             return;
         };
         let s = &self.sessions[idx];
-        if s.client.brand() != Brand::Ds389 {
-            self.status = Some((format!(
-                "creating a domain over LDAP needs 389-DS (this server is {}); OpenLDAP needs cn=config admin access",
-                s.client.brand().label()), true));
+        let brand = s.client.brand();
+        if brand != Brand::Ds389 && brand != Brand::OpenLdap {
+            self.status = Some((format!("creating a domain isn't supported on {}", brand.label()), true));
+            return;
+        }
+        if brand == Brand::OpenLdap && s.cfg.server.config_bind_dn.is_none() {
+            self.status = Some(("set config_bind_dn / config_password_cmd (+ provision_cmd) to create a domain on this OpenLDAP server".into(), true));
             return;
         }
         if s.mode != ConnMode::Write {
@@ -434,36 +453,154 @@ impl App {
         self.overlay = Some(Overlay::Input(overlay::InputDialog::new_domain(idx)));
     }
 
-    /// Create domain `suffix` on the server of session `template_idx`, then connect it
-    /// as a new session and add it to the rail. The template connection must be in
-    /// Write mode; the new domain inherits Write.
+    /// Create domain `suffix` on the server of session `template_idx`. 389-DS is pure
+    /// LDAP; OpenLDAP also needs a filesystem step on the host (a new backend's
+    /// directory), which goes through `provision_cmd` after a review.
     fn do_create_domain(&mut self, template_idx: usize, suffix: &str) {
         if template_idx >= self.sessions.len() { return; }
         if self.sessions[template_idx].mode != ConnMode::Write {
             self.status = Some(("set the connection to write before creating a domain".into(), true));
             return;
         }
-        if let Err(e) = self.sessions[template_idx].client.create_domain(suffix) {
-            self.status = Some((format!("create failed: {e:#}"), true));
-            return;
+        match self.sessions[template_idx].client.brand() {
+            Brand::Ds389 => {
+                if let Err(e) = self.sessions[template_idx].client.create_domain(suffix) {
+                    self.status = Some((format!("create failed: {e:#}"), true));
+                    return;
+                }
+                match self.register_new_domain(template_idx, suffix, None) {
+                    Ok(()) => self.status = Some((format!("created domain {suffix}"), false)),
+                    Err(e) => self.status = Some((format!("created {suffix}, but connecting it failed: {e:#}"), true)),
+                }
+            }
+            Brand::OpenLdap => self.openldap_create_domain(template_idx, suffix),
+            b => self.status = Some((format!("creating a domain isn't supported on {}", b.label()), true)),
         }
-        // Connect the new domain as its own session, sharing the server's cfg/secret.
+    }
+
+    /// Connect a freshly-created domain as its own session and show it in the rail.
+    /// `bind_override` sets the new session's bind DN (OpenLDAP: `cn=admin,<suffix>`;
+    /// 389-DS keeps the Directory Manager, so `None`).
+    fn register_new_domain(&mut self, template_idx: usize, suffix: &str, bind_override: Option<String>) -> anyhow::Result<()> {
         let (mut cfg, password, config_password, pw_source, server_label) = {
             let t = &self.sessions[template_idx];
             (t.cfg.clone(), t.password.clone(), t.config_password.clone(), t.conn.password.clone(), t.server_label.clone())
         };
         cfg.server.base_dn = suffix.to_string();
+        if let Some(b) = bind_override { cfg.server.bind_dn = Some(b); }
         let domain_label = crate::config::domain_label(suffix);
-        match Session::connect(cfg, password, config_password, pw_source, ConnMode::Write, server_label.clone(), domain_label) {
-            Ok(sess) => {
-                self.sessions.push(sess);
-                self.session_ui.push(SessionUi::default());
-                self.rail_expanded.insert(server_label);
-                self.rebuild_rail_rows();
-                self.status = Some((format!("created domain {suffix}"), false));
-            }
-            Err(e) => self.status = Some((format!("created {suffix}, but connecting it failed: {e:#}"), true)),
+        let sess = Session::connect(cfg, password, config_password, pw_source,
+                                    ConnMode::Write, server_label.clone(), domain_label)?;
+        self.sessions.push(sess);
+        self.session_ui.push(SessionUi::default());
+        self.rail_expanded.insert(server_label);
+        self.rebuild_rail_rows();
+        Ok(())
+    }
+
+    /// Build the plan for creating an OpenLDAP domain (derive the backend directory
+    /// from a sibling via a `cn=config` bind), then either review-and-run it (if
+    /// `provision_cmd` is set) or print the exact host commands to run.
+    fn openldap_create_domain(&mut self, idx: usize, suffix: &str) {
+        let suffix = suffix.trim().to_string();
+        if !suffix.to_lowercase().starts_with("dc=") {
+            self.status = Some((format!("expected a domain DN like dc=example,dc=org (got {suffix:?})"), true));
+            return;
         }
+        // A cn=config bind is needed to read a sibling's directory + add the backend.
+        let cfg = self.sessions[idx].cfg.clone();
+        let Some(config_bind) = cfg.server.config_bind_dn.clone() else {
+            self.status = Some(("set config_bind_dn / config_password_cmd for this OpenLDAP server to create a domain".into(), true));
+            return;
+        };
+        let mut ccfg = cfg.clone();
+        ccfg.server.bind_dn = Some(config_bind);
+        let base = match LdapClient::connect(&ccfg, self.sessions[idx].config_password.as_deref()) {
+            Ok(mut c) => { let b = c.openldap_db_dir_base(); c.close().ok(); b }
+            Err(e) => { self.status = Some((format!("cn=config connect failed: {e:#}"), true)); return; }
+        };
+        let be: String = suffix.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let dir = format!("{}/{be}", base.trim_end_matches('/'));
+        let user = cfg.server.slapd_user.clone().unwrap_or_else(|| "openldap:openldap".to_string());
+        let fs_script = format!("mkdir -p '{dir}' && chown {user} '{dir}'");
+
+        match cfg.server.provision_cmd {
+            Some(_) => {
+                let prompt = format!(
+                    "Create domain {suffix} on this OpenLDAP host.\n\
+                     \n1. via provision_cmd, on the host:\n     {fs_script}\n\
+                     \n2. census then, over LDAP:\n     add backend olcDatabase (suffix {suffix}, dir {dir})\n     add the apex + ou=users/ou=groups\n\
+                     \nProceed?");
+                self.pending_provision = Some(ProvisionPlan { session_idx: idx, suffix, dir, fs_script });
+                self.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::review_provision(prompt)));
+            }
+            None => {
+                self.status = Some((format!(
+                    "no provision_cmd set. On the LDAP host run:  {fs_script}  — then set provision_cmd and retry (census will add the backend + skeleton)."), true));
+            }
+        }
+    }
+
+    /// Run the confirmed provisioning plan (create an OpenLDAP domain).
+    fn execute_provision(&mut self) {
+        let Some(plan) = self.pending_provision.take() else { return; };
+        self.status = Some(match self.run_create_plan(&plan) {
+            Ok(msg) => (msg, false),
+            Err(e) => (format!("provision failed: {e:#}"), true),
+        });
+    }
+
+    fn run_create_plan(&mut self, plan: &ProvisionPlan) -> anyhow::Result<String> {
+        let idx = plan.session_idx;
+        let cfg = self.sessions[idx].cfg.clone();
+        let provision_cmd = cfg.server.provision_cmd.clone().context("no provision_cmd")?;
+        let config_bind = cfg.server.config_bind_dn.clone().context("no config_bind_dn")?;
+        let data_pw = self.sessions[idx].password.clone();
+        let config_pw = self.sessions[idx].config_password.clone();
+        // 1. Host filesystem: create the backend directory.
+        crate::provision::run(&provision_cmd, &plan.fs_script).context("host provisioning")?;
+        // 2. cn=config: add the backend (rootpw = the server's data admin password).
+        let mut ccfg = cfg.clone();
+        ccfg.server.bind_dn = Some(config_bind);
+        let mut cclient = LdapClient::connect(&ccfg, config_pw.as_deref())?;
+        let rc = cclient.create_openldap_backend(&plan.suffix, &plan.dir, data_pw.as_deref().unwrap_or(""));
+        cclient.close().ok();
+        rc?;
+        // 3. Data: add the apex + skeleton as the new suffix's rootdn.
+        let admin = format!("cn=admin,{}", plan.suffix);
+        let mut dcfg = cfg.clone();
+        dcfg.server.bind_dn = Some(admin.clone());
+        dcfg.server.base_dn = plan.suffix.clone();
+        let mut dclient = LdapClient::connect(&dcfg, data_pw.as_deref())?;
+        let rc = dclient.add_domain_skeleton(&plan.suffix);
+        dclient.close().ok();
+        rc?;
+        // 4. Register it in the rail.
+        self.register_new_domain(idx, &plan.suffix, Some(admin))?;
+        Ok(format!("created domain {}", plan.suffix))
+    }
+
+    /// Delete an OpenLDAP domain: remove its `olcDatabase` over cn=config (unmaps it),
+    /// then `rm -rf` its directory on the host (best-effort), then drop the session.
+    fn openldap_delete_domain(&mut self, idx: usize, suffix: &str) -> anyhow::Result<String> {
+        let cfg = self.sessions[idx].cfg.clone();
+        let config_bind = cfg.server.config_bind_dn.clone()
+            .context("set config_bind_dn to delete a domain on this OpenLDAP server")?;
+        let config_pw = self.sessions[idx].config_password.clone();
+        let mut ccfg = cfg.clone();
+        ccfg.server.bind_dn = Some(config_bind);
+        let mut cclient = LdapClient::connect(&ccfg, config_pw.as_deref())?;
+        let dir = cclient.delete_openldap_backend(suffix);
+        cclient.close().ok();
+        let dir = dir?;
+        // Remove the directory on the host, if we can (else it just lingers, unserved).
+        if let (Some(d), Some(cmd)) = (&dir, cfg.server.provision_cmd.as_deref()) {
+            crate::provision::run(cmd, &format!("rm -rf '{d}'")).ok();
+        }
+        if let Some(t) = self.sessions.iter().position(|s| s.client.base_dn == suffix) {
+            self.remove_session(t);
+        }
+        Ok(format!("deleted domain {suffix}"))
     }
 
     /// D: confirm-and-delete the cursored domain (389-DS + Write; never the last one).
@@ -477,9 +614,13 @@ impl App {
             return;
         }
         let s = &self.sessions[idx];
-        if s.client.brand() != Brand::Ds389 {
-            self.status = Some((format!(
-                "deleting a domain over LDAP needs 389-DS (this server is {})", s.client.brand().label()), true));
+        let brand = s.client.brand();
+        if brand != Brand::Ds389 && brand != Brand::OpenLdap {
+            self.status = Some((format!("deleting a domain isn't supported on {}", brand.label()), true));
+            return;
+        }
+        if brand == Brand::OpenLdap && s.cfg.server.config_bind_dn.is_none() {
+            self.status = Some(("set config_bind_dn for this OpenLDAP server to delete a domain".into(), true));
             return;
         }
         if s.mode != ConnMode::Write {
@@ -497,9 +638,20 @@ impl App {
     fn do_delete_domain(&mut self, idx: usize) {
         if idx >= self.sessions.len() || self.sessions.len() <= 1 { return; }
         let suffix = self.sessions[idx].client.base_dn.clone();
-        if let Err(e) = self.sessions[idx].client.delete_domain(&suffix) {
-            self.status = Some((format!("delete failed: {e:#}"), true));
-            return;
+        match self.sessions[idx].client.brand() {
+            Brand::OpenLdap => {
+                self.status = Some(match self.openldap_delete_domain(idx, &suffix) {
+                    Ok(msg) => (msg, false),
+                    Err(e) => (format!("delete failed: {e:#}"), true),
+                });
+                return;
+            }
+            _ => {
+                if let Err(e) = self.sessions[idx].client.delete_domain(&suffix) {
+                    self.status = Some((format!("delete failed: {e:#}"), true));
+                    return;
+                }
+            }
         }
         self.remove_session(idx);
         self.status = Some((format!("deleted domain {suffix}"), false));
@@ -1015,6 +1167,10 @@ fn handle_paste(app: &mut App, text: String) -> anyhow::Result<bool> {
                 app.overlay = None;
                 app.do_add_schema(session_idx, kind, &definition);
             }
+            OverlayResult::RunProvision => {
+                app.overlay = None;
+                app.execute_provision();
+            }
         }
         return Ok(false);
     }
@@ -1226,6 +1382,10 @@ fn handle_key(
             OverlayResult::AddSchema { session_idx, kind, definition } => {
                 app.overlay = None;
                 app.do_add_schema(session_idx, kind, &definition);
+            }
+            OverlayResult::RunProvision => {
+                app.overlay = None;
+                app.execute_provision();
             }
         }
         return Ok(false);

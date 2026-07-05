@@ -20,6 +20,8 @@ pub enum ConfirmKind {
 enum Outcome {
     Act(Action),
     DeleteDomain { session_idx: usize },
+    /// Run the pending host-provisioning plan (OpenLDAP domain create/delete).
+    RunProvision,
 }
 
 pub struct ConfirmDialog {
@@ -57,11 +59,24 @@ impl ConfirmDialog {
         }
     }
 
+    /// A `y/N` review of a pending host-provisioning plan; `prompt` may be multi-line
+    /// (the exact commands census will run).
+    pub fn review_provision(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            kind: ConfirmKind::YesNo,
+            typed: String::new(),
+            cursor: 0,
+            outcome: Outcome::RunProvision,
+        }
+    }
+
     /// The result to emit once confirmed.
     fn confirmed(&self) -> OverlayResult {
         match &self.outcome {
             Outcome::Act(a) => OverlayResult::Commit(a.clone()),
             Outcome::DeleteDomain { session_idx } => OverlayResult::DeleteDomain { session_idx: *session_idx },
+            Outcome::RunProvision => OverlayResult::RunProvision,
         }
     }
 
@@ -95,17 +110,25 @@ impl ConfirmDialog {
     }
 
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
-        let w = area.width.saturating_sub(8).clamp(24, 80);
-        let h = match self.kind { ConfirmKind::YesNo => 5, ConfirmKind::TypedDn { .. } => 7 };
+        // YesNo prompts may be multi-line (a review of exact commands); size to fit.
+        let lines: Vec<&str> = self.prompt.split('\n').collect();
+        let w = area.width.saturating_sub(6).clamp(24, 96);
+        let h = match self.kind {
+            ConfirmKind::YesNo => 3 + lines.len() as u16,
+            ConfirmKind::TypedDn { .. } => 7,
+        };
         let rect = modal_frame(buf, area, w, h);
         btxt(buf, rect.x + 2, rect.y, "  confirm  ", s_title());
-        btxt(buf, rect.x + 2, rect.y + 1, &self.prompt, s_normal());
 
         match &self.kind {
             ConfirmKind::YesNo => {
+                for (i, line) in lines.iter().enumerate() {
+                    btxt(buf, rect.x + 2, rect.y + 1 + i as u16, line, s_normal());
+                }
                 btxt(buf, rect.x + 2, rect.y + rect.height - 1, " y:yes  any other:cancel ", s_dim());
             }
             ConfirmKind::TypedDn { expected } => {
+                btxt(buf, rect.x + 2, rect.y + 1, &self.prompt, s_normal());
                 btxt(buf, rect.x + 2, rect.y + 2, &format!("type: {expected}"), s_dim());
                 let matches = &self.typed == expected;
                 // The field text is coloured green once it matches, red until then.

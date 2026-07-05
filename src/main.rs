@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod conninfo;
 mod ldap;
+mod provision;
 mod schema;
 mod session;
 mod tui;

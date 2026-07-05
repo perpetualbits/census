@@ -76,6 +76,16 @@ pub struct ServerConfig {
     /// uses the Directory Manager). Leave unset otherwise.
     pub config_bind_dn: Option<String>,
     pub config_password_cmd: Option<String>,
+    /// For creating/deleting a **domain** on OpenLDAP: a command that runs a shell
+    /// SCRIPT (read from stdin) as root on the LDAP host — census pipes the required
+    /// `mkdir`/`chown`/`rm` to it (a new backend needs its on-disk directory, which no
+    /// LDAP client can create remotely). Examples: `ssh ldap.example.com sudo bash -s`,
+    /// `podman exec -i census-ldap bash`. Without it, census prints the exact commands
+    /// for you to run instead.
+    pub provision_cmd: Option<String>,
+    /// `user:group` slapd runs as, for chowning a new backend's directory
+    /// (default `openldap:openldap`). OpenLDAP domain-create only.
+    pub slapd_user: Option<String>,
     /// TLS SNI / certificate name override. Reserved for verified tunnel
     /// connections; not consulted by the rustls path yet.
     #[allow(dead_code)]

@@ -85,6 +85,9 @@ pub enum OverlayResult {
     /// Close the modal and add a schema definition (`kind`, an RFC 4512 string) to the
     /// server of session `session_idx`.
     AddSchema { session_idx: usize, kind: crate::ldap::client::SchemaKind, definition: String },
+    /// Close the modal and run the app's pending host-provisioning plan (OpenLDAP
+    /// domain create/delete: the FS step + the cn=config LDAP steps).
+    RunProvision,
 }
 
 /// The set of modal dialogs. One is active at a time via `App::overlay`.

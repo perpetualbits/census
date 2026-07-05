@@ -110,6 +110,10 @@ confd() {
             if [ "$brand" = openldap ]; then
                 echo "config_bind_dn      = \"cn=admin,cn=config\""
                 echo "config_password_cmd = \"printf $OL_PW\""
+                # Creating/deleting a domain also needs a host FS step (a new backend's
+                # directory). This runs it in the container. (podman kube names the
+                # container ${name}-slapd; the ./fleet.sh path names it ${name}.)
+                echo "provision_cmd       = \"$ENGINE exec -i $name bash\""
             fi
             for suffix in $rest; do
                 echo ""

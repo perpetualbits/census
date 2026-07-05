@@ -391,6 +391,16 @@ impl LdapClient {
         ).context("create mapping tree")?.success().context("create mapping tree rejected")?;
 
         // 3. Apex + ou=users / ou=groups skeleton.
+        let _ = label;
+        self.add_domain_skeleton(suffix)?;
+        Ok(())
+    }
+
+    /// Add a domain's apex (`objectClass: domain`) plus `ou=users` / `ou=groups`. The
+    /// bound identity must be able to write `suffix` (its own rootdn). Shared by 389-DS
+    /// and OpenLDAP domain creation.
+    pub fn add_domain_skeleton(&mut self, suffix: &str) -> anyhow::Result<()> {
+        let label = crate::config::domain_label(suffix);
         self.conn.add(suffix, vec![
             ("objectClass", HashSet::from(["top", "domain"])),
             ("dc", HashSet::from([label.as_str()])),
@@ -402,6 +412,55 @@ impl LdapClient {
             ]).context("create ou")?.success().context("create ou rejected")?;
         }
         Ok(())
+    }
+
+    /// The parent directory an existing OpenLDAP `mdb` backend keeps its data in (e.g.
+    /// `/var/lib/ldap` from a sibling's `/var/lib/ldap/dc_x`), so a new backend can be a
+    /// sibling. Falls back to `/var/lib/ldap`. This client must be a `cn=config` admin.
+    pub fn openldap_db_dir_base(&mut self) -> String {
+        self.conn
+            .search("cn=config", Scope::Subtree, "(objectClass=olcMdbConfig)", vec!["olcDbDirectory"])
+            .ok()
+            .and_then(|r| r.0.into_iter().next())
+            .map(SearchEntry::construct)
+            .and_then(|e| e.attrs.get("olcDbDirectory").and_then(|v| v.first()).cloned())
+            .and_then(|d| d.rsplit_once('/').map(|(parent, _)| parent.to_string()))
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "/var/lib/ldap".to_string())
+    }
+
+    /// Add an OpenLDAP `mdb` backend (`olcDatabase`) for `suffix`, whose on-disk `dir`
+    /// must already exist (see the host `provision_cmd`). `rootpw` becomes the new
+    /// domain's `cn=admin,<suffix>` password. This client must be a `cn=config` admin.
+    pub fn create_openldap_backend(&mut self, suffix: &str, dir: &str, rootpw: &str) -> anyhow::Result<()> {
+        let rootdn = format!("cn=admin,{suffix}");
+        self.conn.add("olcDatabase=mdb,cn=config", vec![
+            ("objectClass", HashSet::from(["olcDatabaseConfig", "olcMdbConfig"])),
+            ("olcDatabase", HashSet::from(["mdb"])),
+            ("olcSuffix", HashSet::from([suffix])),
+            ("olcDbDirectory", HashSet::from([dir])),
+            ("olcRootDN", HashSet::from([rootdn.as_str()])),
+            ("olcRootPW", HashSet::from([rootpw])),
+            ("olcAccess", HashSet::from(["{0}to * by * read"])),
+        ]).context("add olcDatabase")?.success().context("add olcDatabase rejected")?;
+        Ok(())
+    }
+
+    /// Remove the OpenLDAP `mdb` backend serving `suffix` (its `olcDatabase` entry —
+    /// which unmaps it). Returns the backend's `olcDbDirectory` so the caller can also
+    /// remove it on-disk. This client must be a `cn=config` admin.
+    pub fn delete_openldap_backend(&mut self, suffix: &str) -> anyhow::Result<Option<String>> {
+        let entry = self.conn
+            .search("cn=config", Scope::Subtree,
+                    &format!("(&(objectClass=olcMdbConfig)(olcSuffix={}))", ldap3::ldap_escape(suffix)),
+                    vec!["olcDbDirectory"])
+            .context("find olcDatabase")?
+            .0.into_iter().next().map(SearchEntry::construct);
+        let Some(e) = entry else { anyhow::bail!("no OpenLDAP backend serves {suffix}"); };
+        let dir = e.attrs.get("olcDbDirectory").and_then(|v| v.first()).cloned();
+        self.conn.delete(&e.dn).context("delete olcDatabase")?
+            .success().context("delete olcDatabase rejected")?;
+        Ok(dir)
     }
 
     /// Delete a domain (naming context) `suffix` from this server. **389-DS only.**

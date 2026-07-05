@@ -26,6 +26,15 @@ verify    = true                       # require valid TLS certificate
 # config_bind_dn      = "cn=admin,cn=config"
 # config_password_cmd = "rbw get 'My LDAP cn=config'"
 
+# Creating/deleting a DOMAIN on OpenLDAP also needs a filesystem step on the server (a
+# new backend needs its on-disk directory, which no LDAP client can make remotely).
+# provision_cmd runs a shell script census pipes to it, as root on the LDAP host — set
+# it to your access to that host. Without it, census prints the exact command to run.
+# 389 Directory Server doesn't need this. Examples:
+# provision_cmd = "ssh ldap.example.com sudo bash -s"    # remote host over SSH+sudo
+# provision_cmd = "podman exec -i census-ldap bash"      # a local container
+# slapd_user    = "openldap:openldap"                    # who to chown the dir to (default)
+
 # How password changes are written:
 #   "exop"  → RFC 3062 Password Modify; the server hashes per its policy (default)
 #   "crypt" → census writes userPassword: {CRYPT}$6$… (client-side SHA-512)
