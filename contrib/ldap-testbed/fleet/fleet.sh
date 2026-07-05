@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Bring up a small multi-BRAND, multi-DOMAIN LDAP test fleet for exercising census's
+# multi-connection features (the connections rail, per-connection mode, and — later —
+# migration between directories). Distinct from the parent directory's single 2M-user
+# OpenLDAP scale server: these are small, functional servers of BOTH open-source
+# brands, some hosting several domains (suffixes) in one instance.
+#
+#   ./fleet.sh up        build + start all six servers, seeded
+#   ./fleet.sh status    container state + naming contexts
+#   ./fleet.sh confd     write census conf.d/*.toml for the fleet (see --dest)
+#   ./fleet.sh down      stop & remove the containers
+#   ./fleet.sh destroy   same as down (these servers keep no named volumes)
+#
+# Engine: podman if present, else docker (override with CENSUS_ENGINE).
+#
+#   name                  brand     port   domains (suffixes)
+#   fleet-openldap-a      OpenLDAP  3390   dc=alpha,dc=test
+#   fleet-openldap-b      OpenLDAP  3391   dc=bravo,dc=test
+#   fleet-openldap-multi  OpenLDAP  3392   dc=north,dc=example + dc=south,dc=example
+#   fleet-ds389-a         389-DS    3393   dc=gamma,dc=test
+#   fleet-ds389-b         389-DS    3394   dc=delta,dc=test
+#   fleet-ds389-multi     389-DS    3395   dc=east,dc=example + dc=west,dc=example
+set -euo pipefail
+cd "$(dirname "$0")"
+
+ENGINE="${CENSUS_ENGINE:-$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)}"
+OL_IMG=census-fleet-openldap:latest
+OL_PW=secret            # OpenLDAP rootpw for every cn=admin,<suffix>
+DS_IMG=docker.io/389ds/dirsrv:latest   # fully-qualified so podman resolves it too
+DS_PW=secret389         # 389-DS Directory Manager password
+
+# name|brand|port|space-separated suffixes
+FLEET=(
+    "fleet-openldap-a|openldap|3390|dc=alpha,dc=test"
+    "fleet-openldap-b|openldap|3391|dc=bravo,dc=test"
+    "fleet-openldap-multi|openldap|3392|dc=north,dc=example dc=south,dc=example"
+    "fleet-ds389-a|ds389|3393|dc=gamma,dc=test"
+    "fleet-ds389-b|ds389|3394|dc=delta,dc=test"
+    "fleet-ds389-multi|ds389|3395|dc=east,dc=example dc=west,dc=example"
+)
+
+log()   { printf '\033[1;35m[fleet]\033[0m %s\n' "$*"; }
+be_of() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]//g'; }
+
+build_openldap() { log "building $OL_IMG (this is quick after the first time)"; $ENGINE build -t "$OL_IMG" -f openldap.Containerfile . ; }
+
+start_openldap() {   # name port "suffixes"
+    local name=$1 port=$2 domains=$3
+    $ENGINE rm -f "$name" >/dev/null 2>&1 || true
+    log "OpenLDAP  $name  :$port   [$domains]"
+    $ENGINE run -d --name "$name" -p "$port:389" \
+        -e "DOMAINS=$domains" -e "ADMIN_PW=$OL_PW" "$OL_IMG" >/dev/null
+}
+
+start_ds389() {      # name port "suffixes"
+    local name=$1 port=$2 domains=$3
+    $ENGINE rm -f "$name" >/dev/null 2>&1 || true
+    log "389-DS    $name  :$port   [$domains]"
+    $ENGINE run -d --name "$name" -p "$port:3389" -e "DS_DM_PASSWORD=$DS_PW" "$DS_IMG" >/dev/null
+    # Wait for Directory Manager to answer, then create + seed each suffix.
+    local ready=0
+    for _ in $(seq 1 90); do
+        if ldapsearch -x -H "ldap://localhost:$port" -D "cn=Directory Manager" -w "$DS_PW" -b "" -s base >/dev/null 2>&1; then ready=1; break; fi
+        sleep 1
+    done
+    [ "$ready" = 1 ] || { log "WARNING: $name did not become ready in time"; return; }
+    local uidbase=10000
+    for suffix in $domains; do
+        $ENGINE exec "$name" dsconf localhost backend create \
+            --suffix "$suffix" --be-name "$(be_of "$suffix")" --create-suffix >/dev/null 2>&1 || true
+        NOAPEX=1 ./mkseed.sh "$suffix" "$uidbase" \
+            | ldapadd -x -H "ldap://localhost:$port" -D "cn=Directory Manager" -w "$DS_PW" -c >/dev/null 2>&1 || true
+        uidbase=$((uidbase + 1000))
+    done
+}
+
+for_each() {   # calls $1 name brand port domains
+    local fn=$1 entry name brand port domains
+    for entry in "${FLEET[@]}"; do
+        IFS='|' read -r name brand port domains <<<"$entry"
+        "$fn" "$name" "$brand" "$port" "$domains"
+    done
+}
+
+do_up()    { case "$2" in openldap) start_openldap "$1" "$3" "$4";; ds389) start_ds389 "$1" "$3" "$4";; esac; }
+do_down()  { $ENGINE rm -f "$1" >/dev/null 2>&1 || true; }
+do_status(){
+    local st; st=$($ENGINE ps --filter "name=$1" --format '{{.Status}} {{.Ports}}' 2>/dev/null || true)
+    printf '  %-22s %-9s :%s  %s\n' "$1" "$2" "$3" "${st:-(not running)}"
+}
+
+# Write census conf.d files for the fleet into $DEST.
+confd() {
+    # Default: write example configs into this repo dir. Pass --dest to install them
+    # into your live ~/.config/census/conf.d so a bare `census` shows the fleet.
+    local dest="${1:-./conf.d}"
+    mkdir -p "$dest"
+    local entry name brand port domains primary rest
+    for entry in "${FLEET[@]}"; do
+        IFS='|' read -r name brand port domains <<<"$entry"
+        read -r primary rest <<<"$domains"          # first suffix is primary; rest are [[domain]]
+        local bind pwcmd
+        if [ "$brand" = ds389 ]; then bind="cn=Directory Manager"; pwcmd="printf $DS_PW"
+        else                          bind="cn=admin,$primary";    pwcmd="printf $OL_PW"; fi
+        {
+            echo "# ${brand} fleet server — generated by fleet.sh confd"
+            echo "[server]"
+            echo "name         = \"${name#fleet-}\""
+            echo "host         = \"localhost\""
+            echo "port         = $port"
+            echo "use_ssl      = false"
+            echo "base_dn      = \"$primary\""
+            echo "bind_dn      = \"$bind\""
+            echo "password_cmd = \"$pwcmd\""
+            echo "verify       = false"
+            for suffix in $rest; do
+                echo ""
+                echo "[[domain]]"
+                echo "base_dn      = \"$suffix\""
+                # OpenLDAP: each suffix has its own rootdn; 389-DS: one Directory Manager for all.
+                [ "$brand" = openldap ] && echo "bind_dn      = \"cn=admin,$suffix\""
+            done
+        } > "$dest/${name#fleet-}.toml"
+        log "wrote $dest/${name#fleet-}.toml"
+    done
+    log "done — a bare 'census' will now show these in the connections rail"
+}
+
+case "${1:-up}" in
+    up)       build_openldap; for_each do_up; log "fleet up. Next: ./fleet.sh confd  &&  census" ;;
+    build)    build_openldap ;;
+    confd)    shift; DEST=""; [ "${1:-}" = "--dest" ] && DEST="$2"; confd "$DEST" ;;
+    status)   printf '\n'; for_each do_status; printf '\n' ;;
+    down|destroy) for_each do_down; log "fleet removed" ;;
+    *)        grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//' ;;
+esac
