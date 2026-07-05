@@ -25,16 +25,38 @@ read is allowed on the OpenLDAP servers. Both brands advertise **SSS + VLV**, so
 census's windowed browse path is exercised on each (389-DS even has a real persistent
 VLV index — the sub-second case OpenLDAP can't do; see `../../../docs/openldap-testbed.md`).
 
-## Run it
+## Three ways to run it
 
+Both brands **self-seed from the `DOMAINS` env var** (the OpenLDAP image builds a
+multi-`database` slapd.conf; the 389-DS image creates a backend per suffix), so every
+server is a plain, declarative unit — script, compose, and kube all express the same
+fleet.
+
+### 1. Script (podman or docker)
 ```bash
-./fleet.sh up          # build the OpenLDAP image, start + seed all six servers
-./fleet.sh status      # container state + naming contexts
-./fleet.sh down        # stop & remove (these servers keep no named volumes)
+./fleet.sh up          # build both images, start + seed all six servers
+./fleet.sh status      # container state
+./fleet.sh down        # stop & remove (no named volumes → complete teardown)
+```
+Engine: podman if present, else docker — override with `CENSUS_ENGINE=docker`.
+
+### 2. Compose (docker compose / podman compose)
+```bash
+docker compose up -d --build     # or: podman compose up -d --build
+docker compose ps
+docker compose down
 ```
 
-Engine: podman if present, else docker — override with `CENSUS_ENGINE=docker`.
-(The images are `docker.io/389ds/dirsrv` and a locally-built `census-fleet-openldap`.)
+### 3. Pod (`podman kube play`, also a Kubernetes starting point)
+```bash
+podman build -t localhost/census-fleet-openldap:latest -f openldap.Containerfile .
+podman build -t localhost/census-fleet-ds389:latest    -f ds389.Containerfile .
+podman kube play podman-kube.yaml
+podman kube down podman-kube.yaml
+```
+One Pod per server (each brand's daemon binds a fixed container port, so they can't
+share a Pod's netns). `podman-kube.yaml`'s header notes what to change for a real
+cluster (registry images, Deployment+Service, a `/data` PVC for 389-DS).
 
 ## Point census at the fleet
 
@@ -75,10 +97,7 @@ whose `--create-suffix` already makes the apex entry).
 |---|---|
 | `fleet.sh` | orchestrator: build, up/down/status, `confd` generator |
 | `mkseed.sh` | per-suffix seed LDIF (3 users + 1 group, named after the domain) |
-| `openldap.Containerfile` / `openldap-entrypoint.sh` | multi-suffix OpenLDAP image |
+| `openldap.Containerfile` / `openldap-entrypoint.sh` | self-seeding multi-suffix OpenLDAP image |
+| `ds389.Containerfile` / `ds389-entrypoint.sh` | self-seeding multi-suffix 389-DS image (wraps `dscontainer`) |
+| `compose.yaml` / `podman-kube.yaml` | declarative fleet (compose / pod manifests) |
 | `conf.d/` | generated census configs (reference / installable) |
-
-## Not yet here
-A declarative `compose.yaml` / `podman kube play` manifest for the fleet (the 389-DS
-suffix creation needs a post-start step, so it wants an init container). `fleet.sh` is
-the imperative equivalent for now.

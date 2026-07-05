@@ -1,0 +1,59 @@
+# Declarative multi-brand, multi-domain LDAP test fleet — the parity counterpart to
+# fleet.sh. Both brands self-seed from the DOMAINS env var (OpenLDAP builds a
+# multi-database slapd.conf; 389-DS creates a backend per suffix), so every server is
+# a plain service.
+#
+#   docker compose up -d --build      # or: podman compose up -d --build
+#   docker compose ps
+#   docker compose down               # (no named volumes — teardown is complete)
+#
+# Then wire census to it:  ./fleet.sh confd --dest ~/.config/census/conf.d
+#
+# Ports: OpenLDAP 3390-3392, 389-DS 3393-3395 (see README.md for the domain map).
+
+x-openldap: &openldap
+  build: { context: ., dockerfile: openldap.Containerfile }
+  image: census-fleet-openldap:latest
+  restart: unless-stopped
+
+x-ds389: &ds389
+  build: { context: ., dockerfile: ds389.Containerfile }
+  image: census-fleet-ds389:latest
+  restart: unless-stopped
+
+services:
+  fleet-openldap-a:
+    <<: *openldap
+    container_name: fleet-openldap-a
+    environment: { DOMAINS: "dc=alpha,dc=test", ADMIN_PW: secret }
+    ports: ["3390:389"]
+
+  fleet-openldap-b:
+    <<: *openldap
+    container_name: fleet-openldap-b
+    environment: { DOMAINS: "dc=bravo,dc=test", ADMIN_PW: secret }
+    ports: ["3391:389"]
+
+  fleet-openldap-multi:
+    <<: *openldap
+    container_name: fleet-openldap-multi
+    environment: { DOMAINS: "dc=north,dc=example dc=south,dc=example", ADMIN_PW: secret }
+    ports: ["3392:389"]
+
+  fleet-ds389-a:
+    <<: *ds389
+    container_name: fleet-ds389-a
+    environment: { DS_DM_PASSWORD: secret389, DOMAINS: "dc=gamma,dc=test" }
+    ports: ["3393:3389"]
+
+  fleet-ds389-b:
+    <<: *ds389
+    container_name: fleet-ds389-b
+    environment: { DS_DM_PASSWORD: secret389, DOMAINS: "dc=delta,dc=test" }
+    ports: ["3394:3389"]
+
+  fleet-ds389-multi:
+    <<: *ds389
+    container_name: fleet-ds389-multi
+    environment: { DS_DM_PASSWORD: secret389, DOMAINS: "dc=east,dc=example dc=west,dc=example" }
+    ports: ["3395:3389"]

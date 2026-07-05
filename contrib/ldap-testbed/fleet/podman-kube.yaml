@@ -1,0 +1,103 @@
+# `podman kube play` manifest for the multi-brand, multi-domain fleet — and a
+# starting point for real Kubernetes. One Pod per server (each brand's slapd/ns-slapd
+# binds a fixed container port, so they can't share a Pod's network namespace).
+#
+# Build the images under podman first (docker-built images aren't visible to podman):
+#   podman build -t localhost/census-fleet-openldap:latest -f openldap.Containerfile .
+#   podman build -t localhost/census-fleet-ds389:latest    -f ds389.Containerfile .
+#   podman kube play podman-kube.yaml
+#   podman kube down podman-kube.yaml
+#
+# For a real cluster: push the images to a registry the cluster can pull, replace the
+# localhost/ names, promote each Pod to a Deployment + Service, and (for 389-DS) give
+# it a PVC at /data so the seed survives a reschedule. Domain map is in README.md.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fleet-openldap-a
+  labels: { app: census-fleet, brand: openldap }
+spec:
+  containers:
+    - name: slapd
+      image: localhost/census-fleet-openldap:latest
+      env:
+        - { name: DOMAINS, value: "dc=alpha,dc=test" }
+        - { name: ADMIN_PW, value: secret }
+      ports:
+        - { containerPort: 389, hostPort: 3390 }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fleet-openldap-b
+  labels: { app: census-fleet, brand: openldap }
+spec:
+  containers:
+    - name: slapd
+      image: localhost/census-fleet-openldap:latest
+      env:
+        - { name: DOMAINS, value: "dc=bravo,dc=test" }
+        - { name: ADMIN_PW, value: secret }
+      ports:
+        - { containerPort: 389, hostPort: 3391 }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fleet-openldap-multi
+  labels: { app: census-fleet, brand: openldap }
+spec:
+  containers:
+    - name: slapd
+      image: localhost/census-fleet-openldap:latest
+      env:
+        - { name: DOMAINS, value: "dc=north,dc=example dc=south,dc=example" }
+        - { name: ADMIN_PW, value: secret }
+      ports:
+        - { containerPort: 389, hostPort: 3392 }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fleet-ds389-a
+  labels: { app: census-fleet, brand: ds389 }
+spec:
+  containers:
+    - name: nsslapd
+      image: localhost/census-fleet-ds389:latest
+      env:
+        - { name: DS_DM_PASSWORD, value: secret389 }
+        - { name: DOMAINS, value: "dc=gamma,dc=test" }
+      ports:
+        - { containerPort: 3389, hostPort: 3393 }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fleet-ds389-b
+  labels: { app: census-fleet, brand: ds389 }
+spec:
+  containers:
+    - name: nsslapd
+      image: localhost/census-fleet-ds389:latest
+      env:
+        - { name: DS_DM_PASSWORD, value: secret389 }
+        - { name: DOMAINS, value: "dc=delta,dc=test" }
+      ports:
+        - { containerPort: 3389, hostPort: 3394 }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fleet-ds389-multi
+  labels: { app: census-fleet, brand: ds389 }
+spec:
+  containers:
+    - name: nsslapd
+      image: localhost/census-fleet-ds389:latest
+      env:
+        - { name: DS_DM_PASSWORD, value: secret389 }
+        - { name: DOMAINS, value: "dc=east,dc=example dc=west,dc=example" }
+      ports:
+        - { containerPort: 3389, hostPort: 3395 }

@@ -24,9 +24,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ENGINE="${CENSUS_ENGINE:-$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)}"
-OL_IMG=census-fleet-openldap:latest
+OL_IMG=census-fleet-openldap:latest   # built from openldap.Containerfile
 OL_PW=secret            # OpenLDAP rootpw for every cn=admin,<suffix>
-DS_IMG=docker.io/389ds/dirsrv:latest   # fully-qualified so podman resolves it too
+DS_IMG=census-fleet-ds389:latest      # built from ds389.Containerfile (self-seeding)
 DS_PW=secret389         # 389-DS Directory Manager password
 
 # name|brand|port|space-separated suffixes
@@ -42,8 +42,14 @@ FLEET=(
 log()   { printf '\033[1;35m[fleet]\033[0m %s\n' "$*"; }
 be_of() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]//g'; }
 
-build_openldap() { log "building $OL_IMG (this is quick after the first time)"; $ENGINE build -t "$OL_IMG" -f openldap.Containerfile . ; }
+build_images() {
+    log "building $OL_IMG + $DS_IMG (quick after the first time)"
+    $ENGINE build -t "$OL_IMG" -f openldap.Containerfile .
+    $ENGINE build -t "$DS_IMG" -f ds389.Containerfile .
+}
 
+# Both brands self-seed from the DOMAINS env var — the servers are plain, declarative
+# `run` invocations (matching compose.yaml / podman-kube.yaml).
 start_openldap() {   # name port "suffixes"
     local name=$1 port=$2 domains=$3
     $ENGINE rm -f "$name" >/dev/null 2>&1 || true
@@ -56,22 +62,8 @@ start_ds389() {      # name port "suffixes"
     local name=$1 port=$2 domains=$3
     $ENGINE rm -f "$name" >/dev/null 2>&1 || true
     log "389-DS    $name  :$port   [$domains]"
-    $ENGINE run -d --name "$name" -p "$port:3389" -e "DS_DM_PASSWORD=$DS_PW" "$DS_IMG" >/dev/null
-    # Wait for Directory Manager to answer, then create + seed each suffix.
-    local ready=0
-    for _ in $(seq 1 90); do
-        if ldapsearch -x -H "ldap://localhost:$port" -D "cn=Directory Manager" -w "$DS_PW" -b "" -s base >/dev/null 2>&1; then ready=1; break; fi
-        sleep 1
-    done
-    [ "$ready" = 1 ] || { log "WARNING: $name did not become ready in time"; return; }
-    local uidbase=10000
-    for suffix in $domains; do
-        $ENGINE exec "$name" dsconf localhost backend create \
-            --suffix "$suffix" --be-name "$(be_of "$suffix")" --create-suffix >/dev/null 2>&1 || true
-        NOAPEX=1 ./mkseed.sh "$suffix" "$uidbase" \
-            | ldapadd -x -H "ldap://localhost:$port" -D "cn=Directory Manager" -w "$DS_PW" -c >/dev/null 2>&1 || true
-        uidbase=$((uidbase + 1000))
-    done
+    $ENGINE run -d --name "$name" -p "$port:3389" \
+        -e "DS_DM_PASSWORD=$DS_PW" -e "DOMAINS=$domains" "$DS_IMG" >/dev/null
 }
 
 for_each() {   # calls $1 name brand port domains
@@ -127,8 +119,8 @@ confd() {
 }
 
 case "${1:-up}" in
-    up)       build_openldap; for_each do_up; log "fleet up. Next: ./fleet.sh confd  &&  census" ;;
-    build)    build_openldap ;;
+    up)       build_images; for_each do_up; log "fleet up. Next: ./fleet.sh confd  &&  census" ;;
+    build)    build_images ;;
     confd)    shift; DEST=""; [ "${1:-}" = "--dest" ] && DEST="$2"; confd "$DEST" ;;
     status)   printf '\n'; for_each do_status; printf '\n' ;;
     down|destroy) for_each do_down; log "fleet removed" ;;
