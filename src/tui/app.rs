@@ -8,7 +8,7 @@ use mullion::{
     backend::CrosstermBackend, Buffer, EventReader, KeyCode, KeyModifiers, Rect, Terminal,
 };
 
-use crate::config::Config;
+use crate::config::ConnMode;
 use crate::ldap::client::{DitNode, Group, User};
 use crate::session::Session;
 
@@ -58,9 +58,52 @@ pub struct DitRow {
     pub expanded: Option<bool>,
 }
 
+/// Per-session UI state that must follow the focused connection. The *focused*
+/// session's copy lives directly in the [`App`] fields; the others are stashed here
+/// and swapped in by [`App::focus_session`]. `browse` is `None` until a session is
+/// focused for the first time (then spawned and retained, so switching back is instant).
+#[derive(Default)]
+struct SessionUi {
+    browse: Option<Browse>,
+    detail: Option<User>,
+    detail_photo: Option<mullion::video::Frame>,
+    dit_children: HashMap<String, Vec<DitNode>>,
+    dit_truncated: HashSet<String>,
+    dit_expanded: HashSet<String>,
+    dit_rows: Vec<DitRow>,
+    dit_detail: Vec<(String, Vec<String>)>,
+}
+
+/// One flattened row of the connections rail: a server group (parent) or a domain
+/// (leaf, carrying its session index). Mirrors [`DitRow`] so it renders through the
+/// same `mullion::render_tree_row`.
+pub struct RailRow {
+    pub session_idx: Option<usize>, // Some for a domain leaf, None for a server group
+    pub label: String,
+    pub ancestor_last: Vec<bool>,
+    pub is_last: bool,
+    pub expanded: Option<bool>,     // server: Some(expanded); domain leaf: None
+    pub is_server: bool,
+}
+
 pub struct App {
     sessions: Vec<Session>,
-    active:   usize,
+    /// The connection whose data fills the workspace (its browse/DIT/detail live in the
+    /// App fields below; the other sessions' equivalents are stashed in `session_ui`).
+    focused:  usize,
+    /// Connections marked "active" for set operations (compare/migrate — Phase 3).
+    marked:   HashSet<usize>,
+    /// Stashed per-session UI state for the *non-focused* sessions; swapped with the
+    /// live App fields on `focus_session`. `session_ui[focused]` is an empty placeholder.
+    session_ui: Vec<SessionUi>,
+    /// Connections rail (left sidebar): cursor row, whether it holds key focus, and
+    /// which server groups are expanded.
+    rail_cur: ListCursor,
+    rail_focused: bool,
+    rail_expanded: HashSet<String>,
+    rail_rows: Vec<RailRow>,
+    /// A mode change awaiting confirmation: `(session index, new mode)`.
+    pending_mode: Option<(usize, ConnMode)>,
     mode:     Mode,
 
     pub groups_cur: ListCursor,
@@ -110,8 +153,6 @@ pub struct App {
 
     overlay: Option<Overlay>,
     pub status:     Option<(String, bool)>,
-    pub write_mode: bool,
-    pub dry_run:    bool,
 
     anim_start: Instant,
     anim_on: bool,
@@ -123,14 +164,22 @@ pub struct App {
 }
 
 impl App {
-    fn new(sessions: Vec<Session>, write_mode: bool, dry_run: bool, cfg: Config, password: Option<String>) -> Self {
-        // The attribute the browse list is sorted/keyed by; needed to resolve a
-        // search-jump's paging key (captured before `cfg` moves into the worker).
-        let browse_sort_attr = cfg.browse.sort_attr.clone();
-        // The browse list runs on its own thread with its own read-only connection.
-        let browse = Browse::spawn(cfg, password, 20);
+    fn new(sessions: Vec<Session>) -> Self {
+        // The browse list runs on its own thread with its own read-only connection,
+        // built from the focused session's config/secret (session 0 at startup).
+        let s0 = &sessions[0];
+        let browse_sort_attr = s0.cfg.browse.sort_attr.clone();
+        let browse = Browse::spawn(s0.cfg.clone(), s0.password.clone(), 20);
+        let session_ui = (0..sessions.len()).map(|_| SessionUi::default()).collect();
         Self {
-            sessions, active: 0, mode: Mode::Browse,
+            sessions, focused: 0, mode: Mode::Browse,
+            marked: HashSet::new(),
+            session_ui,
+            rail_cur: ListCursor::new(),
+            rail_focused: false,
+            rail_expanded: HashSet::new(),
+            rail_rows: Vec::new(),
+            pending_mode: None,
             browse, browse_sort_attr,
             groups_cur: ListCursor::new(),
             browse_focus: Pane::Left,
@@ -161,7 +210,7 @@ impl App {
             left_cur: ListCursor::new(),
             right_cur: ListCursor::new(),
             overlay: None,
-            status: None, write_mode, dry_run,
+            status: None,
             anim_start: Instant::now(),
             anim_on: true,
             journal: Journal::new(),
@@ -169,20 +218,193 @@ impl App {
         }
     }
 
-    /// May the write UI be opened? True in `--write` or `--dry-run`.
-    fn can_write_ui(&self) -> bool { self.write_mode || self.dry_run }
+    /// May the write UI be opened on the focused connection? True in write or dry-run.
+    pub fn can_write_ui(&self) -> bool { self.session().mode.can_write() }
 
-    /// Short label of the current write mode, for the title bar.
-    pub fn mode_tag(&self) -> &'static str {
-        if self.dry_run { "dry-run" }
-        else if self.write_mode { "write" }
-        else { "read-only" }
-    }
+    /// Short label of the focused connection's mode, for the title bar.
+    pub fn mode_tag(&self) -> &'static str { self.session().mode.tag() }
 
     // ── active session ──────────────────────────────────────────────────────
 
-    fn session(&self) -> &Session { &self.sessions[self.active] }
-    fn session_mut(&mut self) -> &mut Session { &mut self.sessions[self.active] }
+    fn session(&self) -> &Session { &self.sessions[self.focused] }
+    fn session_mut(&mut self) -> &mut Session { &mut self.sessions[self.focused] }
+
+    /// Switch the workspace to session `idx`, stashing the outgoing session's live UI
+    /// state (browse worker, DIT tree, detail) into its slot and restoring the
+    /// incoming session's — lazily spawning its browse worker the first time, then
+    /// retaining it so switching back is instant.
+    fn focus_session(&mut self, idx: usize) {
+        if idx == self.focused || idx >= self.sessions.len() { return; }
+        let old = self.focused;
+        // The new session's browse: reuse its retained worker, or spawn one now. The
+        // per-frame `set_viewport` corrects the seed viewport immediately.
+        let new_browse = match self.session_ui[idx].browse.take() {
+            Some(b) => b,
+            None => {
+                let s = &self.sessions[idx];
+                Browse::spawn(s.cfg.clone(), s.password.clone(), 20)
+            }
+        };
+        // Stash outgoing live state.
+        self.session_ui[old] = SessionUi {
+            browse: Some(std::mem::replace(&mut self.browse, new_browse)),
+            detail: self.detail.take(),
+            detail_photo: self.detail_photo.take(),
+            dit_children: std::mem::take(&mut self.dit_children),
+            dit_truncated: std::mem::take(&mut self.dit_truncated),
+            dit_expanded: std::mem::take(&mut self.dit_expanded),
+            dit_rows: std::mem::take(&mut self.dit_rows),
+            dit_detail: std::mem::take(&mut self.dit_detail),
+        };
+        // Restore incoming stashed state (browse already swapped above).
+        let ui = std::mem::take(&mut self.session_ui[idx]);
+        self.detail = ui.detail;
+        self.detail_photo = ui.detail_photo;
+        self.dit_children = ui.dit_children;
+        self.dit_truncated = ui.dit_truncated;
+        self.dit_expanded = ui.dit_expanded;
+        self.dit_rows = ui.dit_rows;
+        self.dit_detail = ui.dit_detail;
+        self.browse_sort_attr = self.sessions[idx].cfg.browse.sort_attr.clone();
+        self.focused = idx;
+        // Reset transient cursors (not stashed per-session).
+        self.detail_scroll = 0;
+        self.detail_cur = 0;
+        self.dit_cur = ListCursor::new();
+        self.dit_detail_cur = 0;
+        self.browse_focus = Pane::Left;
+        self.status = Some((format!("→ {}", self.session().label()), false));
+        if self.mode == Mode::Dit {
+            self.enter_dit();
+        }
+    }
+
+    /// Expand every server group and place the rail cursor on the focused session.
+    fn init_rail(&mut self) {
+        for s in &self.sessions {
+            self.rail_expanded.insert(s.server_label.clone());
+        }
+        self.rebuild_rail_rows();
+        self.rail_cur.cursor = self.rail_rows.iter()
+            .position(|r| r.session_idx == Some(self.focused))
+            .unwrap_or(0);
+    }
+
+    // ── connections rail accessors (for screens::rail) ───────────────────────
+    pub fn rail_rows(&self) -> &[RailRow] { &self.rail_rows }
+    pub fn rail_cur(&self) -> &ListCursor { &self.rail_cur }
+    pub fn rail_has_focus(&self) -> bool { self.rail_focused }
+    pub fn session_count(&self) -> usize { self.sessions.len() }
+    pub fn session_mode(&self, i: usize) -> ConnMode { self.sessions[i].mode }
+    pub fn is_marked(&self, i: usize) -> bool { self.marked.contains(&i) }
+    pub fn focused_idx(&self) -> usize { self.focused }
+
+    // ── connections rail actions (rail-focused key handling) ─────────────────
+
+    /// Enter/Space/l on the cursored row: expand/collapse a server, or focus a domain
+    /// (and hop to the workspace).
+    fn rail_activate(&mut self) {
+        let Some(row) = self.rail_rows.get(self.rail_cur.cursor) else { return; };
+        let (is_server, label, sidx) = (row.is_server, row.label.clone(), row.session_idx);
+        if is_server {
+            self.toggle_server_expand(&label);
+        } else if let Some(idx) = sidx {
+            self.focus_session(idx);
+            self.rail_focused = false;
+        }
+    }
+
+    /// h/Left on a server row collapses it.
+    fn rail_collapse(&mut self) {
+        let Some(row) = self.rail_rows.get(self.rail_cur.cursor) else { return; };
+        if row.is_server {
+            let label = row.label.clone();
+            if self.rail_expanded.remove(&label) {
+                self.rebuild_rail_rows();
+                self.rail_cur.clamp(self.rail_rows.len());
+            }
+        }
+    }
+
+    fn toggle_server_expand(&mut self, label: &str) {
+        if !self.rail_expanded.remove(label) {
+            self.rail_expanded.insert(label.to_string());
+        }
+        self.rebuild_rail_rows();
+        self.rail_cur.clamp(self.rail_rows.len());
+    }
+
+    /// m: toggle the cursored domain in the marked ("active") set.
+    fn rail_toggle_mark(&mut self) {
+        let Some(row) = self.rail_rows.get(self.rail_cur.cursor) else { return; };
+        if let Some(idx) = row.session_idx {
+            if !self.marked.remove(&idx) { self.marked.insert(idx); }
+            self.status = Some((format!("{} marked", self.marked.len()), false));
+        }
+    }
+
+    /// M: cycle the cursored domain's mode (read-only → write → dry-run → …). Enabling
+    /// live writes waits for y/n confirmation via `pending_mode`.
+    fn rail_cycle_mode(&mut self) {
+        let Some(row) = self.rail_rows.get(self.rail_cur.cursor) else { return; };
+        let Some(idx) = row.session_idx else { return; };
+        let next = match self.sessions[idx].mode {
+            ConnMode::ReadOnly => ConnMode::Write,
+            ConnMode::Write    => ConnMode::DryRun,
+            ConnMode::DryRun   => ConnMode::ReadOnly,
+        };
+        if next == ConnMode::Write {
+            self.pending_mode = Some((idx, next));
+            self.status = Some((format!("Enable WRITES on {}? (y/n)", self.sessions[idx].label()), true));
+        } else {
+            self.sessions[idx].mode = next;
+            self.status = Some((format!("{} → {}", self.sessions[idx].label(), next.tag()), false));
+        }
+    }
+
+    /// Rebuild the flattened rail: each server group (in first-seen order) followed by
+    /// its domain leaves when expanded. Mirrors [`Self::rebuild_dit_rows`].
+    fn rebuild_rail_rows(&mut self) {
+        // Group session indices by server_label, preserving order of first appearance.
+        let mut servers: Vec<(String, Vec<usize>)> = Vec::new();
+        for (i, s) in self.sessions.iter().enumerate() {
+            match servers.iter_mut().find(|(name, _)| name == &s.server_label) {
+                Some((_, v)) => v.push(i),
+                None => servers.push((s.server_label.clone(), vec![i])),
+            }
+        }
+        let mut rows = Vec::new();
+        let nservers = servers.len();
+        for (si, (name, members)) in servers.iter().enumerate() {
+            let server_last = si + 1 == nservers;
+            let expanded = self.rail_expanded.contains(name);
+            rows.push(RailRow {
+                session_idx: None,
+                label: name.clone(),
+                ancestor_last: vec![],
+                is_last: server_last,
+                expanded: Some(expanded),
+                is_server: true,
+            });
+            if expanded {
+                let n = members.len();
+                for (di, &sidx) in members.iter().enumerate() {
+                    rows.push(RailRow {
+                        session_idx: Some(sidx),
+                        label: self.sessions[sidx].domain_label.clone(),
+                        ancestor_last: vec![server_last],
+                        is_last: di + 1 == n,
+                        expanded: None,
+                        is_server: false,
+                    });
+                }
+            }
+        }
+        self.rail_rows = rows;
+    }
+
+    /// Whether the connections rail is shown (only with more than one connection).
+    fn rail_visible(&self) -> bool { self.sessions.len() > 1 }
 
     // ── accessors used by the screen renderers ──────────────────────────────
 
@@ -430,9 +652,10 @@ impl App {
 
 // ─── entry point ─────────────────────────────────────────────────────────────
 
-pub fn run(sessions: Vec<Session>, write_mode: bool, dry_run: bool, cfg: Config, password: Option<String>) -> anyhow::Result<()> {
-    let mut app = App::new(sessions, write_mode, dry_run, cfg, password);
-    if dry_run {
+pub fn run(sessions: Vec<Session>) -> anyhow::Result<()> {
+    let mut app = App::new(sessions);
+    app.init_rail();
+    if app.session().mode == ConnMode::DryRun {
         app.status = Some(("dry-run: writes are simulated, nothing is sent".into(), false));
     }
 
@@ -587,6 +810,11 @@ fn update_offsets(app: &mut App, area: Rect) {
     app.dit_cur.clamp(ndit);
     app.dit_cur.keep_in_view(ndit, vis);
 
+    // Connections rail (spans the full workspace height).
+    let nrail = app.rail_rows.len();
+    app.rail_cur.clamp(nrail);
+    app.rail_cur.keep_in_view(nrail, vis);
+
     // Search results list uses the whole inner area minus the query line + separator.
     let nsearch = app.search_hits.len();
     let search_vis = vis.saturating_sub(2).max(1);
@@ -636,6 +864,24 @@ fn update_offsets(app: &mut App, area: Rect) {
 
 // ─── key handling ────────────────────────────────────────────────────────────
 
+/// Key handling while the connections rail holds focus: navigate the server→domain
+/// tree, focus a domain, mark connections, and cycle a connection's mode.
+fn handle_rail_key(app: &mut App, key: KeyCode) -> anyhow::Result<bool> {
+    use KeyCode::*;
+    match key {
+        Char('q') => return Ok(true),
+        Esc => app.rail_focused = false,
+        Up   | Char('k') => app.rail_cur.up(),
+        Down | Char('j') => app.rail_cur.down(app.rail_rows.len()),
+        Char('l') | Right | Enter | Char(' ') => app.rail_activate(),
+        Char('h') | Left => app.rail_collapse(),
+        Char('m') => app.rail_toggle_mark(),
+        Char('M') => app.rail_cycle_mode(),
+        _ => {}
+    }
+    Ok(false)
+}
+
 fn handle_key(
     app:  &mut App,
     key:  KeyCode,
@@ -648,6 +894,17 @@ fn handle_key(
     // Ctrl-G toggles the border glow (motion off switch).
     if key == Char('g') && mods.contains(KeyModifiers::CONTROL) {
         app.anim_on = !app.anim_on;
+        return Ok(false);
+    }
+
+    // A pending mode change (enabling live writes) waits for y/n confirmation.
+    if let Some((idx, newmode)) = app.pending_mode.take() {
+        if matches!(key, Char('y') | Char('Y') | Enter) {
+            app.sessions[idx].mode = newmode;
+            app.status = Some((format!("{} → {}", app.sessions[idx].label(), newmode.tag()), false));
+        } else {
+            app.status = Some(("mode change cancelled".into(), false));
+        }
         return Ok(false);
     }
 
@@ -668,6 +925,16 @@ fn handle_key(
     if key == Char('?') {
         app.overlay = Some(Overlay::Help(overlay::HelpView::new()));
         return Ok(false);
+    }
+
+    // Backtick toggles key focus between the connections rail and the workspace; while
+    // the rail holds focus it consumes navigation (so `jk`/`Enter`/`m`/`M` drive it).
+    if key == Char('`') && app.rail_visible() {
+        app.rail_focused = !app.rail_focused;
+        return Ok(false);
+    }
+    if app.rail_focused {
+        return handle_rail_key(app, key);
     }
 
     // `u` undoes the last reversible write from any screen (write mode only).
@@ -780,7 +1047,7 @@ fn handle_key(
             },
             Enter => {
                 if !app.can_write_ui() {
-                    app.status = Some(("Read-only — pass --write to modify".into(), true));
+                    app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
                 } else {
                     do_membership_action(app)?;
                 }
@@ -854,7 +1121,7 @@ fn handle_key(
 /// Open a typed-DN delete confirmation for the DIT-selected entry.
 fn open_dit_delete(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let Some(dn) = app.dit_selected_dn() else { return; };
@@ -867,7 +1134,7 @@ fn open_dit_delete(app: &mut App) {
 /// Edit the DIT-selected entry's cursored attribute (single-line or `big` textarea).
 fn open_dit_attr_edit(app: &mut App, big: bool) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let targets = app.dit_edit_targets();
@@ -910,7 +1177,7 @@ fn do_membership_action(app: &mut App) -> anyhow::Result<()> {
 /// Open the attribute-edit modal for the detail pane's selected target.
 fn open_attr_edit(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let targets = screens::detail::edit_targets(app);
@@ -923,7 +1190,7 @@ fn open_attr_edit(app: &mut App) {
 /// Open the multi-line "big edit" textarea for the detail pane's selected attribute.
 fn open_attr_bigedit(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let targets = screens::detail::edit_targets(app);
@@ -936,7 +1203,7 @@ fn open_attr_bigedit(app: &mut App) {
 /// Open the SSH-key manager for the cursored user.
 fn open_key_editor(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let Some(user) = app.detail() else { return; };
@@ -947,7 +1214,7 @@ fn open_key_editor(app: &mut App) {
 /// Open the set-password dialog for the cursored user.
 fn open_passwd(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let Some(user) = app.detail() else { return; };
@@ -958,7 +1225,7 @@ fn open_passwd(app: &mut App) {
 /// Open the new-user form, seeded with the next free uidNumber.
 fn open_new_user(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let suggested = app.session_mut().client.next_uid_number().unwrap_or(10000);
@@ -968,7 +1235,7 @@ fn open_new_user(app: &mut App) {
 /// Open a typed-DN delete confirmation for the user under the list cursor.
 fn open_delete_user(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let Some(user) = app.browse.snapshot.selected_user() else { return; };
@@ -982,7 +1249,7 @@ fn open_delete_user(app: &mut App) {
 /// Open the new-group form, seeded with the next free gidNumber.
 fn open_new_group(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let suggested = app.session_mut().client.next_gid_number().unwrap_or(10000);
@@ -992,7 +1259,7 @@ fn open_new_group(app: &mut App) {
 /// Open a typed-DN delete confirmation for the group under the cursor.
 fn open_delete_group(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let Some(group) = app.groups().get(app.groups_cur.cursor) else { return; };
@@ -1006,7 +1273,7 @@ fn open_delete_group(app: &mut App) {
 /// Open the attribute editor for the group detail pane's selected target.
 fn open_group_attr_edit(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let targets = screens::group_detail::edit_targets(app);
@@ -1019,7 +1286,7 @@ fn open_group_attr_edit(app: &mut App) {
 /// Open the multi-line "big edit" textarea for the group detail pane's selected attribute.
 fn open_group_attr_bigedit(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let targets = screens::group_detail::edit_targets(app);
@@ -1032,7 +1299,7 @@ fn open_group_attr_bigedit(app: &mut App) {
 /// Open the rename dialog (cn/RDN via modrdn) for the cursored group.
 fn open_rename_group(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let Some(group) = app.groups().get(app.groups_cur.cursor) else { return; };
@@ -1044,7 +1311,7 @@ fn open_rename_group(app: &mut App) {
 /// non-RDN name). Undoable. Repeat to strip multiple aliases.
 fn open_remove_alias(app: &mut App) {
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return;
     }
     let Some(group) = app.groups().get(app.groups_cur.cursor) else { return; };
@@ -1106,7 +1373,7 @@ pub(crate) fn describe_action(action: &Action) -> String {
 fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
     // Dry-run: report the LDAP operation that would be sent, log the would-be LDIF
     // to the preview feed, change nothing.
-    if app.dry_run {
+    if app.session().mode == ConnMode::DryRun {
         let base_dn = app.session().client.base_dn.clone();
         let schema  = app.session().client.schema().clone();
         let ldif    = ldif::action_ldif(&action, &base_dn, &schema);
@@ -1115,7 +1382,7 @@ fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
         return Ok(());
     }
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return Ok(());
     }
     // Capture the inverse *before* applying — reversing a delete/replace needs the
@@ -1137,12 +1404,12 @@ fn perform(app: &mut App, action: Action) -> anyhow::Result<()> {
 /// Undo the most recent reversible write by applying its stored inverse (which is
 /// itself journaled, but pushes no new undo step).
 fn undo(app: &mut App) -> anyhow::Result<()> {
-    if app.dry_run {
+    if app.session().mode == ConnMode::DryRun {
         app.status = Some(("dry-run: nothing is actually written, so nothing to undo".into(), false));
         return Ok(());
     }
     if !app.can_write_ui() {
-        app.status = Some(("Read-only — pass --write to modify".into(), true));
+        app.status = Some(("Read-only connection — enable writes with --write or in the rail (` then M)".into(), true));
         return Ok(());
     }
     let Some(step) = app.journal.undo.pop() else {
@@ -1499,23 +1766,36 @@ fn render(app: &App, buf: &mut Buffer) {
         (full, None)
     };
 
+    // With more than one connection (and room), a left rail lists them; the focused
+    // connection's workspace fills the rest. One connection → today's full-width view.
+    let rail_w: u16 = if app.rail_visible() && main.width >= 60 { 26 } else { 0 };
+    let (rail_rect, workspace) = if rail_w > 0 {
+        (Some(Rect::new(main.x, main.y, rail_w, main.height)),
+         Rect::new(main.x + rail_w, main.y, main.width - rail_w, main.height))
+    } else {
+        (None, main)
+    };
+
     match app.mode {
-        Mode::Browse      => screens::users::render(app, buf, main, app.browse_focus),
-        Mode::GroupSelect => screens::groups::render_select(app, buf, main),
-        Mode::Membership  => screens::groups::render_membership(app, buf, main),
-        Mode::Dit         => screens::dit::render(app, buf, main),
-        Mode::Search      => screens::search::render(app, buf, main),
+        Mode::Browse      => screens::users::render(app, buf, workspace, app.browse_focus),
+        Mode::GroupSelect => screens::groups::render_select(app, buf, workspace),
+        Mode::Membership  => screens::groups::render_membership(app, buf, workspace),
+        Mode::Dit         => screens::dit::render(app, buf, workspace),
+        Mode::Search      => screens::search::render(app, buf, workspace),
     }
     if let Some(pa) = preview {
         screens::preview::render(app, buf, pa);
     }
+    if let Some(rr) = rail_rect {
+        screens::rail::render(app, buf, rr);
+    }
 
-    // Connection/password "gap" in the top border of the main frame (content pass):
-    // drawn over the frame the screen just laid down, and excluded from the glow.
-    let gap = super::topgap::draw_top_gap(buf, main, &app.conn_info().summary());
-    // Travelling glow on the main frame, under any modal overlay — skipping the gap.
+    // Connection/password "gap" in the top border of the workspace frame (content
+    // pass): drawn over the frame the screen just laid down, and excluded from the glow.
+    let gap = super::topgap::draw_top_gap(buf, workspace, &app.conn_info().summary());
+    // Travelling glow on the workspace frame, under any modal overlay — skipping the gap.
     if app.anim_on {
-        glow::edge_glow(buf, main, app.anim_start.elapsed().as_secs_f32(), gap.as_slice());
+        glow::edge_glow(buf, workspace, app.anim_start.elapsed().as_secs_f32(), gap.as_slice());
     }
     if let Some(ov) = &app.overlay {
         ov.render(buf, full);

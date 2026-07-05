@@ -151,7 +151,7 @@ pub fn render_membership(app: &App, buf: &mut Buffer, area: Rect) {
                  if *is_err { s_err() } else { s_ok() });
         }
         None => {
-            let pairs: &[(&str, &str)] = if app.write_mode {
+            let pairs: &[(&str, &str)] = if app.can_write_ui() {
                 &[("Tab", "switch"), ("Enter", "add/remove"), ("u", "undo"),
                   ("L", "ldif"), ("Esc", "browse"), ("q", "quit")]
             } else {

@@ -48,3 +48,32 @@ remote_port = 636
 # or the server won't use the index.
 # sort_attr     = "uid"        # default; e.g. "sortRank"
 # sort_ordering = "2.5.13.3"   # caseIgnoreOrderingMatch (string); "2.5.13.15" = integerOrderingMatch
+
+# ── Optional: a human label for this server, shown in the connections rail. ──
+# [server] name = "example-prod"   # defaults to the config file's name
+
+# ── Multiple directories at once ──────────────────────────────────────────────
+# census can connect to several directories in one session. Two ways to add them:
+#
+#  1. Multiple DOMAINS on this same server — add [[domain]] blocks. `server.base_dn`
+#     above is always the primary domain; each [[domain]] adds another, sharing this
+#     server's transport (and, unless overridden, its bind). Handy for one slapd that
+#     hosts dc=jive, dc=nova, … as separate suffixes.
+#
+#  2. Multiple SERVERS — put one .toml file per server in ~/.config/census/conf.d/.
+#     census auto-loads them all at startup (filename order) and shows a connections
+#     rail. (An explicit `--config FILE` instead loads just that one file.)
+#
+# When more than one connection is present, the left rail lets you switch focus
+# (Enter), mark connections (m), and change a connection's mode (M). Per-connection
+# `mode` (below) sets the default; the CLI --write / --dry-run override all.
+#
+# [[domain]]
+# base_dn      = "dc=jive,dc=example,dc=com"
+# mode         = "read-only"                 # read-only | write | dry-run  (optional)
+#
+# [[domain]]
+# base_dn      = "dc=nova,dc=example,dc=com"
+# mode         = "write"
+# bind_dn      = "cn=dm,dc=nova,dc=example,dc=com"   # optional per-domain bind override
+# password_cmd = "rbw get 'nova ldap'"              # optional per-domain secret override
