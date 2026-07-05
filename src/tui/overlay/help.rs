@@ -35,6 +35,8 @@ const MANUAL: &[&str] = &[
     "  b              back up the cursored domain to an LDIF file (in the working dir)",
     "  C              migrate the cursored domain's WHOLE subtree to the marked write",
     "                 targets (background; DNs rebased, existing entries skipped)",
+    "  =              compare the cursored domain against the single marked domain,",
+    "                 by relative DN — writes a .diff report (only-source/target/differing)",
     "  N              create a new domain on this server (write mode; 389-DS, or OpenLDAP",
     "                  with config_bind_dn + provision_cmd — census reviews the host commands)",
     "  D              delete the cursored domain (type the suffix to confirm)",

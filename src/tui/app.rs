@@ -146,6 +146,8 @@ pub struct App {
     backups: Backups,
     /// In-flight whole-domain migrations running on background threads.
     migrations: crate::tui::migrate::Migrations,
+    /// In-flight cross-domain comparisons running on background threads.
+    comparisons: crate::tui::compare::Comparisons,
     mode:     Mode,
 
     pub groups_cur: ListCursor,
@@ -237,6 +239,7 @@ impl App {
             pending_domain_migration: None,
             backups: Backups::new(),
             migrations: crate::tui::migrate::Migrations::new(),
+            comparisons: crate::tui::compare::Comparisons::new(),
             browse, browse_sort_attr,
             groups_cur: ListCursor::new(),
             browse_focus: Pane::Left,
@@ -365,6 +368,7 @@ impl App {
     pub fn focused_idx(&self) -> usize { self.focused }
     pub fn backups_active(&self) -> usize { self.backups.active() }
     pub fn migrations_active(&self) -> usize { self.migrations.active() }
+    pub fn comparisons_active(&self) -> usize { self.comparisons.active() }
 
     // ── connections rail actions (rail-focused key handling) ─────────────────
 
@@ -508,6 +512,37 @@ impl App {
         }).collect();
         self.migrations.start(cfg, password, plan.base, targets, plan.label.clone());
         self.status = Some((format!("migrating {} to {} target(s) in the background…", plan.label, plan.targets.len()), false));
+    }
+
+    /// = (rail): compare the cursored domain (source) against the single marked domain
+    /// (target), by relative DN. Read-only, so it starts immediately on a background worker;
+    /// the diff report is written to a file and the summary lands in the status line.
+    fn rail_compare_domains(&mut self) {
+        let Some(source) = self.rail_rows.get(self.rail_cur.cursor).and_then(|r| r.session_idx) else {
+            self.status = Some(("move the cursor onto a domain to compare it".into(), true));
+            return;
+        };
+        let others: Vec<usize> = self.marked.iter().copied()
+            .filter(|&t| t != source && t < self.sessions.len())
+            .collect();
+        let [target] = others[..] else {
+            self.status = Some(("mark exactly one other domain with `m` in the rail to compare against (the cursored one is the source)".into(), true));
+            return;
+        };
+        let side = |idx: usize| crate::tui::compare::Side {
+            cfg: self.sessions[idx].cfg.clone(),
+            password: self.sessions[idx].password.clone(),
+            base: self.sessions[idx].client.base_dn.clone(),
+            label: self.sessions[idx].label(),
+        };
+        let (src, tgt) = (side(source), side(target));
+        let label = format!("{} vs {}", src.label, tgt.label);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let slug = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
+        let path = std::path::PathBuf::from(format!("compare-{}-vs-{}-{stamp}.diff", slug(&src.label), slug(&tgt.label)));
+        self.comparisons.start(src, tgt, path, label.clone());
+        self.status = Some((format!("comparing {label} in the background…"), false));
     }
 
     /// The session to act on for the cursored rail row: the domain's own session, or
@@ -1282,6 +1317,9 @@ fn main_loop(
         if let Some(status) = app.migrations.poll() {
             app.status = Some(status);
         }
+        if let Some(status) = app.comparisons.poll() {
+            app.status = Some(status);
+        }
         // Fire the debounced server search once typing has settled (never per keystroke).
         app.tick_search();
         term.draw(|buf| {
@@ -1521,6 +1559,7 @@ fn handle_rail_key(app: &mut App, key: KeyCode) -> anyhow::Result<bool> {
         Char('M') => app.rail_cycle_mode(),
         Char('b') => app.rail_backup(),
         Char('C') => app.rail_migrate_domain(),
+        Char('=') => app.rail_compare_domains(),
         Char('N') => app.rail_new_domain(),
         Char('D') => app.rail_delete_domain(),
         Char('s') => { if let Some(idx) = app.rail_template_session() { app.enter_schema(idx); } }

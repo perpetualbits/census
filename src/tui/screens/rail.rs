@@ -34,6 +34,9 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect) {
     if app.migrations_active() > 0 {
         header.push_str(&format!(" ⇉{}", app.migrations_active()));
     }
+    if app.comparisons_active() > 0 {
+        header.push_str(&format!(" ⇌{}", app.comparisons_active()));
+    }
     ColumnGrid::write_text(buf, r, r.y, &header, Align::Start, hs);
     hline(buf, Rect::new(r.x, r.y + 1, r.width, 1));
 

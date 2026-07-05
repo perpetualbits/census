@@ -1,6 +1,7 @@
 pub mod app;
 pub mod backup;
 pub mod browse;
+pub mod compare;
 pub mod draw;
 pub mod focus;
 pub mod glow;
