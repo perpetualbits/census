@@ -75,6 +75,10 @@ pub enum OverlayResult {
     Cancel,
     /// Close the modal and perform this action.
     Commit(Action),
+    /// Close the modal and create a new domain `suffix` on the server of session
+    /// `template_idx` (handled outside the `Action`/undo machinery — it manages
+    /// sessions, not entries).
+    CreateDomain { template_idx: usize, suffix: String },
 }
 
 /// The set of modal dialogs. One is active at a time via `App::overlay`.

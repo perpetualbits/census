@@ -9,7 +9,7 @@ use mullion::{
 };
 
 use crate::config::ConnMode;
-use crate::ldap::client::{DitNode, Group, User};
+use crate::ldap::client::{Brand, DitNode, Group, User};
 use crate::session::Session;
 
 use super::backup::Backups;
@@ -388,6 +388,66 @@ impl App {
         self.status = Some((format!("backing up {domain} in the background…"), false));
     }
 
+    /// The session to act on for the cursored rail row: the domain's own session, or
+    /// (on a server row) the first session belonging to that server.
+    fn rail_template_session(&self) -> Option<usize> {
+        let row = self.rail_rows.get(self.rail_cur.cursor)?;
+        if let Some(idx) = row.session_idx { return Some(idx); }
+        self.sessions.iter().position(|s| s.server_label == row.label)
+    }
+
+    /// N: prompt to create a new domain on the cursored server (389-DS + Write only).
+    fn rail_new_domain(&mut self) {
+        let Some(idx) = self.rail_template_session() else {
+            self.status = Some(("no connection here to create a domain on".into(), true));
+            return;
+        };
+        let s = &self.sessions[idx];
+        if s.client.brand() != Brand::Ds389 {
+            self.status = Some((format!(
+                "creating a domain over LDAP needs 389-DS (this server is {}); OpenLDAP needs cn=config admin access",
+                s.client.brand().label()), true));
+            return;
+        }
+        if s.mode != ConnMode::Write {
+            self.status = Some(("set this connection to write (M) before creating a domain".into(), true));
+            return;
+        }
+        self.overlay = Some(Overlay::Input(overlay::InputDialog::new_domain(idx)));
+    }
+
+    /// Create domain `suffix` on the server of session `template_idx`, then connect it
+    /// as a new session and add it to the rail. The template connection must be in
+    /// Write mode; the new domain inherits Write.
+    fn do_create_domain(&mut self, template_idx: usize, suffix: &str) {
+        if template_idx >= self.sessions.len() { return; }
+        if self.sessions[template_idx].mode != ConnMode::Write {
+            self.status = Some(("set the connection to write before creating a domain".into(), true));
+            return;
+        }
+        if let Err(e) = self.sessions[template_idx].client.create_domain(suffix) {
+            self.status = Some((format!("create failed: {e:#}"), true));
+            return;
+        }
+        // Connect the new domain as its own session, sharing the server's cfg/secret.
+        let (mut cfg, password, pw_source, server_label) = {
+            let t = &self.sessions[template_idx];
+            (t.cfg.clone(), t.password.clone(), t.conn.password.clone(), t.server_label.clone())
+        };
+        cfg.server.base_dn = suffix.to_string();
+        let domain_label = crate::config::domain_label(suffix);
+        match Session::connect(cfg, password, pw_source, ConnMode::Write, server_label.clone(), domain_label) {
+            Ok(sess) => {
+                self.sessions.push(sess);
+                self.session_ui.push(SessionUi::default());
+                self.rail_expanded.insert(server_label);
+                self.rebuild_rail_rows();
+                self.status = Some((format!("created domain {suffix}"), false));
+            }
+            Err(e) => self.status = Some((format!("created {suffix}, but connecting it failed: {e:#}"), true)),
+        }
+    }
+
     /// Rebuild the flattened rail: each server group (in first-seen order) followed by
     /// its domain leaves when expanded. Mirrors [`Self::rebuild_dit_rows`].
     fn rebuild_rail_rows(&mut self) {
@@ -761,6 +821,10 @@ fn handle_paste(app: &mut App, text: String) -> anyhow::Result<bool> {
                 app.overlay = None;
                 perform(app, action)?;
             }
+            OverlayResult::CreateDomain { template_idx, suffix } => {
+                app.overlay = None;
+                app.do_create_domain(template_idx, &suffix);
+            }
         }
         return Ok(false);
     }
@@ -908,6 +972,7 @@ fn handle_rail_key(app: &mut App, key: KeyCode) -> anyhow::Result<bool> {
         Char('m') => app.rail_toggle_mark(),
         Char('M') => app.rail_cycle_mode(),
         Char('b') => app.rail_backup(),
+        Char('N') => app.rail_new_domain(),
         _ => {}
     }
     Ok(false)
@@ -947,6 +1012,10 @@ fn handle_key(
             OverlayResult::Commit(action) => {
                 app.overlay = None;
                 perform(app, action)?;
+            }
+            OverlayResult::CreateDomain { template_idx, suffix } => {
+                app.overlay = None;
+                app.do_create_domain(template_idx, &suffix);
             }
         }
         return Ok(false);

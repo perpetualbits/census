@@ -29,12 +29,33 @@ pub struct Caps {
     pub paged: bool,
 }
 
+/// Which LDAP server brand this is, from the rootDSE — it decides how server-admin
+/// operations (creating/deleting a domain) are performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Brand {
+    /// OpenLDAP (slapd): rootDSE carries `objectClass: OpenLDAProotDSE`.
+    OpenLdap,
+    /// 389 Directory Server: `vendorName: 389 Project`.
+    Ds389,
+    /// Something else, or undetectable.
+    #[default]
+    Other,
+}
+
+impl Brand {
+    /// Short label for the UI.
+    pub fn label(self) -> &'static str {
+        match self { Brand::OpenLdap => "OpenLDAP", Brand::Ds389 => "389-DS", Brand::Other => "LDAP" }
+    }
+}
+
 pub struct LdapClient {
     conn: LdapConn,
     pub base_dn: String,
     schema: Schema,
     password_scheme: PwScheme,
     caps: Caps,
+    brand: Brand,
     /// Attribute + orderingRule OID the browse list is sorted by (from `[browse]`
     /// config; default `uid` / caseIgnoreOrderingMatch). See [`BrowseConfig`].
     browse_sort_attr: String,
@@ -146,6 +167,7 @@ impl LdapClient {
         }
 
         let caps = detect_caps(&mut conn);
+        let brand = detect_brand(&mut conn);
 
         Ok(Self {
             conn,
@@ -153,6 +175,7 @@ impl LdapClient {
             schema: Schema::rfc2307(),
             password_scheme: cfg.server.password_scheme,
             caps,
+            brand,
             browse_sort_attr: cfg.browse.sort_attr.clone(),
             browse_sort_ordering: cfg.browse.sort_ordering.clone(),
             _tunnel: tun,
@@ -301,6 +324,65 @@ impl LdapClient {
         }
         stream.result().success().context("export ended with an error")?;
         Ok(n)
+    }
+
+    /// The detected server brand (OpenLDAP / 389-DS / other).
+    pub fn brand(&self) -> Brand { self.brand }
+
+    /// Create a new domain (naming context) `suffix` on this server, plus the
+    /// `ou=users`/`ou=groups` skeleton census expects. **389-DS only:** it adds the
+    /// backend + mapping-tree entries under `cn=config` (writable by the Directory
+    /// Manager bind). OpenLDAP's config tree isn't reachable over the data connection,
+    /// so this errors there. `suffix` must be a `dc=…` DN.
+    pub fn create_domain(&mut self, suffix: &str) -> anyhow::Result<()> {
+        if self.brand != Brand::Ds389 {
+            anyhow::bail!(
+                "creating a domain over LDAP needs 389 Directory Server (this is {}); \
+                 OpenLDAP needs cn=config admin access, which the data connection lacks",
+                self.brand.label()
+            );
+        }
+        let suffix = suffix.trim();
+        if !suffix.to_lowercase().starts_with("dc=") || !suffix.contains(',') && suffix.matches('=').count() < 1 {
+            anyhow::bail!("expected a domain DN like dc=example,dc=org (got {suffix:?})");
+        }
+        let be: String = suffix.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let label = crate::config::domain_label(suffix);
+
+        // 1. Backend config entry.
+        self.conn.add(
+            &format!("cn={be},cn=ldbm database,cn=plugins,cn=config"),
+            vec![
+                ("objectClass", HashSet::from(["top", "extensibleObject", "nsBackendInstance"])),
+                ("cn", HashSet::from([be.as_str()])),
+                ("nsslapd-suffix", HashSet::from([suffix])),
+            ],
+        ).context("create backend")?.success().context("create backend rejected")?;
+
+        // 2. Mapping-tree entry (RDN value is the suffix → escape '=' and ',').
+        let esc = suffix.replace('=', "\\3D").replace(',', "\\2C");
+        self.conn.add(
+            &format!("cn={esc},cn=mapping tree,cn=config"),
+            vec![
+                ("objectClass", HashSet::from(["top", "extensibleObject", "nsMappingTree"])),
+                ("cn", HashSet::from([suffix])),
+                ("nsslapd-state", HashSet::from(["backend"])),
+                ("nsslapd-backend", HashSet::from([be.as_str()])),
+            ],
+        ).context("create mapping tree")?.success().context("create mapping tree rejected")?;
+
+        // 3. Apex + ou=users / ou=groups skeleton.
+        self.conn.add(suffix, vec![
+            ("objectClass", HashSet::from(["top", "domain"])),
+            ("dc", HashSet::from([label.as_str()])),
+        ]).context("create apex")?.success().context("create apex rejected")?;
+        for ou in ["users", "groups"] {
+            self.conn.add(&format!("ou={ou},{suffix}"), vec![
+                ("objectClass", HashSet::from(["top", "organizationalUnit"])),
+                ("ou", HashSet::from([ou])),
+            ]).context("create ou")?.success().context("create ou rejected")?;
+        }
+        Ok(())
     }
 
     /// How this client reached the directory (direct vs SSH tunnel), for the UI.
@@ -721,6 +803,25 @@ impl LdapClient {
 }
 
 // ---------- helpers ---------------------------------------------------------
+
+/// Detect the server brand from the rootDSE (`objectClass` / `vendorName`).
+/// Best-effort — undetectable servers are [`Brand::Other`].
+fn detect_brand(conn: &mut LdapConn) -> Brand {
+    let entry = conn
+        .search("", Scope::Base, "(objectClass=*)", vec!["objectClass", "vendorName"])
+        .ok()
+        .and_then(|r| r.success().ok())
+        .and_then(|(rs, _)| rs.into_iter().next())
+        .map(SearchEntry::construct);
+    let Some(e) = entry else { return Brand::Other; };
+    if e.attrs.get("objectClass").is_some_and(|ocs| ocs.iter().any(|o| o.eq_ignore_ascii_case("OpenLDAProotDSE"))) {
+        return Brand::OpenLdap;
+    }
+    if e.attrs.get("vendorName").and_then(|v| v.first()).is_some_and(|v| v.contains("389")) {
+        return Brand::Ds389;
+    }
+    Brand::Other
+}
 
 /// Read the rootDSE `supportedControl` and note the paging controls census cares
 /// about. Best-effort: any failure yields all-false (census falls back to bounded

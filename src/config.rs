@@ -261,7 +261,7 @@ fn dedup(list: Vec<EffectiveConfig>) -> Vec<EffectiveConfig> {
 
 /// The short label for a domain: the value of the leftmost RDN of `base_dn`
 /// (`dc=jive,dc=astron,dc=nl` → `jive`), or the whole DN if it can't be split.
-fn domain_label(base_dn: &str) -> String {
+pub fn domain_label(base_dn: &str) -> String {
     base_dn.split(',').next()
         .and_then(|rdn| rdn.split('=').nth(1))
         .map(str::trim)

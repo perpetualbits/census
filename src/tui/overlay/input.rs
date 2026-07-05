@@ -16,6 +16,8 @@ enum Target {
     Attr { dn: String, attr: String },
     /// Rename a group: change its `cn` RDN to the typed value.
     Rename { dn: String, old_name: String },
+    /// Create a new domain (naming context) on the server of session `template_idx`.
+    NewDomain { template_idx: usize },
 }
 
 /// A one-line text editor rendered as a centred modal box. The text buffer and
@@ -63,6 +65,20 @@ impl InputDialog {
         }
     }
 
+    /// Prompt for a new domain's suffix (a `dc=…` DN) to create on the server of
+    /// session `template_idx`.
+    pub fn new_domain(template_idx: usize) -> Self {
+        Self {
+            title: "create domain (new naming context)".into(),
+            label: "suffix (e.g. dc=team,dc=example)".into(),
+            value: String::new(),
+            cursor: 0,
+            masked: false,
+            ctx: dctx(),
+            target: Target::NewDomain { template_idx },
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyCode, _mods: KeyModifiers) -> OverlayResult {
         use KeyCode::*;
         match key {
@@ -86,6 +102,13 @@ impl InputDialog {
                                 new_cn: value,
                                 old_name: old_name.clone(),
                             })
+                        }
+                    }
+                    Target::NewDomain { template_idx } => {
+                        if value.is_empty() {
+                            OverlayResult::Cancel
+                        } else {
+                            OverlayResult::CreateDomain { template_idx: *template_idx, suffix: value }
                         }
                     }
                 }

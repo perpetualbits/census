@@ -33,6 +33,7 @@ const MANUAL: &[&str] = &[
     "  M              cycle a connection's mode: read-only ○ → write ● → dry-run ✎",
     "                 (enabling writes asks y/n first). ◀ marks the focused domain.",
     "  b              back up the cursored domain to an LDIF file (in the working dir)",
+    "  N              create a new domain on this server (389-DS; connection must be write)",
     "",
     "# Search  (/)",
     "  Type to filter users and groups live; matches come from first/last name,",
