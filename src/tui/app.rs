@@ -362,6 +362,40 @@ impl App {
         }
     }
 
+    /// b: back up (LDIF-export) the cursored domain's full subtree to a file in the
+    /// working directory. Read-only, and streamed so a huge domain doesn't exhaust
+    /// memory. (It runs synchronously and blocks the UI until done — a background
+    /// export is a follow-up; fine for the small directories this first targets.)
+    fn rail_backup(&mut self) {
+        let Some(idx) = self.rail_rows.get(self.rail_cur.cursor).and_then(|r| r.session_idx) else {
+            self.status = Some(("move the cursor onto a domain to back it up".into(), true));
+            return;
+        };
+        let (server, domain, base) = {
+            let s = &self.sessions[idx];
+            (s.server_label.clone(), s.domain_label.clone(), s.client.base_dn.clone())
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let path = std::path::PathBuf::from(format!("{server}-{domain}-{stamp}.ldif"));
+
+        let result = (|| -> anyhow::Result<u64> {
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&path)?);
+            writeln!(w, "# census backup of {base} ({server})\nversion: 1")?;
+            let n = self.sessions[idx].client.stream_subtree(&base, |se| {
+                write!(w, "\n{}", ldif::entry_ldif(&se.dn, &se.attrs, &se.bin_attrs))?;
+                Ok(())
+            })?;
+            w.flush()?;
+            Ok(n)
+        })();
+        self.status = Some(match result {
+            Ok(n)  => (format!("backed up {n} entries → {}", path.display()), false),
+            Err(e) => (format!("backup failed: {e:#}"), true),
+        });
+    }
+
     /// Rebuild the flattened rail: each server group (in first-seen order) followed by
     /// its domain leaves when expanded. Mirrors [`Self::rebuild_dit_rows`].
     fn rebuild_rail_rows(&mut self) {
@@ -877,6 +911,7 @@ fn handle_rail_key(app: &mut App, key: KeyCode) -> anyhow::Result<bool> {
         Char('h') | Left => app.rail_collapse(),
         Char('m') => app.rail_toggle_mark(),
         Char('M') => app.rail_cycle_mode(),
+        Char('b') => app.rail_backup(),
         _ => {}
     }
     Ok(false)

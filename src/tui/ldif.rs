@@ -81,6 +81,36 @@ pub fn action_ldif(action: &Action, base_dn: &str, schema: &Schema) -> String {
     }
 }
 
+// ── content records (backup / export) ────────────────────────────────────────
+
+/// An RFC 2849 *content* record (no `changetype`): the DN followed by every attribute
+/// value — text attrs from `attrs`, binary ones from `bin` (e.g. `jpegPhoto`) — with
+/// anything not LDIF-safe base64-encoded. Attributes are emitted sorted with
+/// `objectClass` first, so an export is stable and re-loadable with `ldapadd`.
+pub fn entry_ldif(
+    dn: &str,
+    attrs: &std::collections::HashMap<String, Vec<String>>,
+    bin: &std::collections::HashMap<String, Vec<Vec<u8>>>,
+) -> String {
+    let mut s = format!("{}\n", attr_line("dn", dn.as_bytes()));
+    let mut keys: Vec<&String> = attrs.keys().chain(bin.keys()).collect();
+    keys.sort_by(|a, b| {
+        // objectClass first, then case-insensitive alpha.
+        let rank = |k: &str| !k.eq_ignore_ascii_case("objectClass");
+        rank(a).cmp(&rank(b)).then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+    });
+    keys.dedup();
+    for k in keys {
+        if let Some(vals) = attrs.get(k) {
+            for v in vals { s.push_str(&attr_line(k, v.as_bytes())); s.push('\n'); }
+        }
+        if let Some(vals) = bin.get(k) {
+            for v in vals { s.push_str(&attr_line(k, v)); s.push('\n'); }
+        }
+    }
+    s
+}
+
 // ── record shapes ────────────────────────────────────────────────────────────
 
 fn modify(dn: &str, op: &str, body: &[String]) -> String {
@@ -163,6 +193,30 @@ mod tests {
             ldif,
             "dn: cn=cobalt,ou=groups,dc=lofar,dc=eu\nchangetype: modify\nadd: memberUid\nmemberUid: quixote\n-\n"
         );
+    }
+
+    #[test]
+    fn entry_ldif_is_a_content_record_objectclass_first() {
+        use std::collections::HashMap;
+        let mut attrs = HashMap::new();
+        attrs.insert("uid".to_string(), vec!["ada".to_string()]);
+        attrs.insert("objectClass".to_string(), vec!["top".to_string(), "posixAccount".to_string()]);
+        attrs.insert("cn".to_string(), vec!["Ada".to_string()]);
+        let s = entry_ldif("uid=ada,dc=x", &attrs, &HashMap::new());
+        // dn first, then objectClass (both values), then the rest alphabetically.
+        assert!(s.starts_with(
+            "dn: uid=ada,dc=x\nobjectClass: top\nobjectClass: posixAccount\ncn: Ada\n"
+        ), "got:\n{s}");
+        assert!(!s.contains("changetype")); // a content record, not a change record
+    }
+
+    #[test]
+    fn entry_ldif_base64s_binary_attrs() {
+        use std::collections::HashMap;
+        let mut bin = HashMap::new();
+        bin.insert("jpegPhoto".to_string(), vec![vec![0xff, 0xd8, 0xff]]);
+        let s = entry_ldif("uid=x,dc=y", &HashMap::new(), &bin);
+        assert!(s.contains("jpegPhoto:: "), "got:\n{s}");
     }
 
     #[test]

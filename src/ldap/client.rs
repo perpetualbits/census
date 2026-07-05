@@ -281,6 +281,28 @@ impl LdapClient {
         Ok(groups)
     }
 
+    /// Stream every entry in the subtree under `base` to `on_entry`, paging with
+    /// Simple Paged Results so even a huge domain is walked in constant memory (nothing
+    /// is accumulated here). Read-only — the caller (a backup/export) formats each
+    /// [`SearchEntry`] as LDIF. Returns the number of entries streamed.
+    pub fn stream_subtree<F>(&mut self, base: &str, mut on_entry: F) -> anyhow::Result<u64>
+    where
+        F: FnMut(SearchEntry) -> anyhow::Result<()>,
+    {
+        use ldap3::adapters::{Adapter, PagedResults};
+        let adapters: Vec<Box<dyn Adapter<&str, Vec<&str>>>> = vec![Box::new(PagedResults::new(500))];
+        let mut stream = self.conn
+            .streaming_search_with(adapters, base, Scope::Subtree, "(objectClass=*)", vec!["*"])
+            .context("export search failed")?;
+        let mut n = 0u64;
+        while let Some(entry) = stream.next().context("export paging failed")? {
+            on_entry(SearchEntry::construct(entry))?;
+            n += 1;
+        }
+        stream.result().success().context("export ended with an error")?;
+        Ok(n)
+    }
+
     /// How this client reached the directory (direct vs SSH tunnel), for the UI.
     pub fn conn_via(&self) -> &ConnVia { &self.conn_via }
 
