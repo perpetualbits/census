@@ -12,6 +12,7 @@ use crate::config::ConnMode;
 use crate::ldap::client::{DitNode, Group, User};
 use crate::session::Session;
 
+use super::backup::Backups;
 use super::browse::Browse;
 
 use super::focus::{ListCursor, Pane};
@@ -104,6 +105,8 @@ pub struct App {
     rail_rows: Vec<RailRow>,
     /// A mode change awaiting confirmation: `(session index, new mode)`.
     pending_mode: Option<(usize, ConnMode)>,
+    /// In-flight domain backups (LDIF export) running on background threads.
+    backups: Backups,
     mode:     Mode,
 
     pub groups_cur: ListCursor,
@@ -180,6 +183,7 @@ impl App {
             rail_expanded: HashSet::new(),
             rail_rows: Vec::new(),
             pending_mode: None,
+            backups: Backups::new(),
             browse, browse_sort_attr,
             groups_cur: ListCursor::new(),
             browse_focus: Pane::Left,
@@ -298,6 +302,7 @@ impl App {
     pub fn session_mode(&self, i: usize) -> ConnMode { self.sessions[i].mode }
     pub fn is_marked(&self, i: usize) -> bool { self.marked.contains(&i) }
     pub fn focused_idx(&self) -> usize { self.focused }
+    pub fn backups_active(&self) -> usize { self.backups.active() }
 
     // ── connections rail actions (rail-focused key handling) ─────────────────
 
@@ -363,37 +368,24 @@ impl App {
     }
 
     /// b: back up (LDIF-export) the cursored domain's full subtree to a file in the
-    /// working directory. Read-only, and streamed so a huge domain doesn't exhaust
-    /// memory. (It runs synchronously and blocks the UI until done — a background
-    /// export is a follow-up; fine for the small directories this first targets.)
+    /// working directory. Read-only, streamed (constant memory), and run on a
+    /// background thread with its own connection so a huge domain never blocks the UI;
+    /// progress and the final path arrive via [`Backups::poll`].
     fn rail_backup(&mut self) {
         let Some(idx) = self.rail_rows.get(self.rail_cur.cursor).and_then(|r| r.session_idx) else {
             self.status = Some(("move the cursor onto a domain to back it up".into(), true));
             return;
         };
-        let (server, domain, base) = {
+        let (server, domain, base, cfg, password) = {
             let s = &self.sessions[idx];
-            (s.server_label.clone(), s.domain_label.clone(), s.client.base_dn.clone())
+            (s.server_label.clone(), s.domain_label.clone(), s.client.base_dn.clone(),
+             s.cfg.clone(), s.password.clone())
         };
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let path = std::path::PathBuf::from(format!("{server}-{domain}-{stamp}.ldif"));
-
-        let result = (|| -> anyhow::Result<u64> {
-            use std::io::Write;
-            let mut w = std::io::BufWriter::new(std::fs::File::create(&path)?);
-            writeln!(w, "# census backup of {base} ({server})\nversion: 1")?;
-            let n = self.sessions[idx].client.stream_subtree(&base, |se| {
-                write!(w, "\n{}", ldif::entry_ldif(&se.dn, &se.attrs, &se.bin_attrs))?;
-                Ok(())
-            })?;
-            w.flush()?;
-            Ok(n)
-        })();
-        self.status = Some(match result {
-            Ok(n)  => (format!("backed up {n} entries → {}", path.display()), false),
-            Err(e) => (format!("backup failed: {e:#}"), true),
-        });
+        self.backups.start(cfg, password, base, path, domain.clone());
+        self.status = Some((format!("backing up {domain} in the background…"), false));
     }
 
     /// Rebuild the flattened rail: each server group (in first-seen order) followed by
@@ -720,6 +712,10 @@ fn main_loop(
         app.browse.poll();
         if app.mode == Mode::Browse {
             app.ensure_detail_loaded();
+        }
+        // Surface progress/completion from background domain backups.
+        if let Some(status) = app.backups.poll() {
+            app.status = Some(status);
         }
         // Fire the debounced server search once typing has settled (never per keystroke).
         app.tick_search();

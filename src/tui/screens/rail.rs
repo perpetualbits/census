@@ -26,8 +26,12 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect) {
     let r = rects.into_iter().find(|(id, _)| *id == RAIL).map(|(_, r)| r).unwrap_or(area);
 
     let hs = if has_focus { s_head() } else { s_subhead() };
-    ColumnGrid::write_text(buf, r, r.y, &format!("connections ({})", app.session_count()),
-                           Align::Start, hs);
+    // Compact so it fits the narrow rail; `⇊N` = N background backups running.
+    let mut header = format!("connections ({})", app.session_count());
+    if app.backups_active() > 0 {
+        header.push_str(&format!(" ⇊{}", app.backups_active()));
+    }
+    ColumnGrid::write_text(buf, r, r.y, &header, Align::Start, hs);
     hline(buf, Rect::new(r.x, r.y + 1, r.width, 1));
 
     let data = Rect::new(r.x, r.y + 2, r.width, r.height.saturating_sub(2));
