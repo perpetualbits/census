@@ -91,6 +91,9 @@ pub enum OverlayResult {
     /// Close the modal and run the app's pending migration (copy an entry to the
     /// marked connections).
     RunMigration,
+    /// Close the modal and start the app's pending whole-domain migration (stream the
+    /// source subtree to the marked write targets, on a background worker).
+    RunDomainMigration,
 }
 
 /// The set of modal dialogs. One is active at a time via `App::overlay`.

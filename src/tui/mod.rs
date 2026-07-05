@@ -6,6 +6,7 @@ pub mod focus;
 pub mod glow;
 pub mod journal;
 pub mod ldif;
+pub mod migrate;
 pub mod overlay;
 pub mod photo;
 pub mod screens;

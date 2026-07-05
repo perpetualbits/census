@@ -972,6 +972,21 @@ impl LdapClient {
         Ok(())
     }
 
+    /// Add an entry from raw attributes, returning the **raw LDAP result code** rather
+    /// than treating a non-zero code as an error. A whole-domain migration uses this to
+    /// distinguish benign codes — 68 `entryAlreadyExists` (the target already has it) and
+    /// 32 `noSuchObject` (parent not added yet, retry later) — from real failures.
+    pub fn add_raw_rc(&mut self, dn: &str, attrs: &[(String, Vec<Vec<u8>>)]) -> anyhow::Result<u32> {
+        let add_attrs: Vec<(&[u8], HashSet<&[u8]>)> = attrs.iter()
+            .map(|(name, vals)| {
+                let set: HashSet<&[u8]> = vals.iter().map(Vec::as_slice).collect();
+                (name.as_bytes(), set)
+            })
+            .collect();
+        let res = self.conn.add(dn, add_attrs).context("migration add failed")?;
+        Ok(res.rc)
+    }
+
     // ---------- DIT browser -------------------------------------------------
 
     /// One level of children directly under `base` (for the tree browser). Sorted

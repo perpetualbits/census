@@ -108,6 +108,16 @@ struct MigrationPlan {
     label: String,
 }
 
+/// A confirmed-but-not-yet-started whole-domain migration: stream the source domain's
+/// whole subtree into the write targets (each entry rebased onto the target's base-DN),
+/// on a background worker.
+struct DomainMigrationPlan {
+    source: usize,
+    targets: Vec<usize>,
+    base: String,
+    label: String,
+}
+
 pub struct App {
     sessions: Vec<Session>,
     /// The connection whose data fills the workspace (its browse/DIT/detail live in the
@@ -130,8 +140,12 @@ pub struct App {
     pending_provision: Option<ProvisionPlan>,
     /// A migration awaiting the operator's review/confirmation.
     pending_migration: Option<MigrationPlan>,
+    /// A whole-domain migration awaiting the operator's review/confirmation.
+    pending_domain_migration: Option<DomainMigrationPlan>,
     /// In-flight domain backups (LDIF export) running on background threads.
     backups: Backups,
+    /// In-flight whole-domain migrations running on background threads.
+    migrations: crate::tui::migrate::Migrations,
     mode:     Mode,
 
     pub groups_cur: ListCursor,
@@ -220,7 +234,9 @@ impl App {
             pending_mode: None,
             pending_provision: None,
             pending_migration: None,
+            pending_domain_migration: None,
             backups: Backups::new(),
+            migrations: crate::tui::migrate::Migrations::new(),
             browse, browse_sort_attr,
             groups_cur: ListCursor::new(),
             browse_focus: Pane::Left,
@@ -348,6 +364,7 @@ impl App {
     pub fn is_marked(&self, i: usize) -> bool { self.marked.contains(&i) }
     pub fn focused_idx(&self) -> usize { self.focused }
     pub fn backups_active(&self) -> usize { self.backups.active() }
+    pub fn migrations_active(&self) -> usize { self.migrations.active() }
 
     // ── connections rail actions (rail-focused key handling) ─────────────────
 
@@ -431,6 +448,66 @@ impl App {
         let path = std::path::PathBuf::from(format!("{server}-{domain}-{stamp}.ldif"));
         self.backups.start(cfg, password, base, path, domain.clone());
         self.status = Some((format!("backing up {domain} in the background…"), false));
+    }
+
+    /// C (rail): migrate the cursored domain's WHOLE subtree to the marked *write* targets.
+    /// The cursored domain is the source; every marked connection in strict Write mode
+    /// (dry-run/read-only are excluded — bulk preview isn't supported) is a target. Shows a
+    /// review confirm; the copy then runs on a background worker.
+    fn rail_migrate_domain(&mut self) {
+        let Some(source) = self.rail_rows.get(self.rail_cur.cursor).and_then(|r| r.session_idx) else {
+            self.status = Some(("move the cursor onto a domain to migrate it".into(), true));
+            return;
+        };
+        let base = self.sessions[source].client.base_dn.clone();
+        let mut targets: Vec<usize> = self.marked.iter().copied()
+            .filter(|&t| t != source && t < self.sessions.len() && self.sessions[t].mode == ConnMode::Write)
+            .collect();
+        targets.sort_unstable();
+        // Note any marked-but-not-writable connections so the exclusion isn't silent.
+        let non_write = self.marked.iter().copied()
+            .filter(|&t| t != source && t < self.sessions.len() && self.sessions[t].mode != ConnMode::Write)
+            .count();
+        if targets.is_empty() {
+            let hint = if non_write > 0 {
+                "marked target(s) must be in write mode (M in the rail); dry-run/read-only are excluded"
+            } else {
+                "mark write target connection(s) with `m` in the rail (the cursored one is the source)"
+            };
+            self.status = Some((hint.into(), true));
+            return;
+        }
+        let label = self.sessions[source].label();
+        let names: Vec<String> = targets.iter().map(|&t| self.sessions[t].label()).collect();
+        let extra = if non_write > 0 {
+            format!("\n({non_write} marked non-write connection(s) excluded)")
+        } else { String::new() };
+        let prompt = format!(
+            "Migrate the WHOLE domain\n  {label}  ({base})\nto {} write target(s):\n  {}\n\nStreams every entry; existing entries are skipped,\neach DN is rebased onto the target's base-DN.{extra}\n\nProceed?",
+            targets.len(), names.join("\n  "));
+        self.pending_domain_migration = Some(DomainMigrationPlan { source, targets, base, label });
+        self.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::review_domain_migration(prompt)));
+    }
+
+    /// Start the confirmed whole-domain migration on a background worker (mirrors the
+    /// backup path): the source domain streams its subtree into every write target.
+    fn start_domain_migration(&mut self) {
+        let Some(plan) = self.pending_domain_migration.take() else { return; };
+        let (cfg, password) = {
+            let s = &self.sessions[plan.source];
+            (s.cfg.clone(), s.password.clone())
+        };
+        let targets: Vec<crate::tui::migrate::TargetSpec> = plan.targets.iter().map(|&t| {
+            let s = &self.sessions[t];
+            crate::tui::migrate::TargetSpec {
+                cfg: s.cfg.clone(),
+                password: s.password.clone(),
+                base: s.client.base_dn.clone(),
+                label: s.label(),
+            }
+        }).collect();
+        self.migrations.start(cfg, password, plan.base, targets, plan.label.clone());
+        self.status = Some((format!("migrating {} to {} target(s) in the background…", plan.label, plan.targets.len()), false));
     }
 
     /// The session to act on for the cursored rail row: the domain's own session, or
@@ -1198,8 +1275,11 @@ fn main_loop(
         if app.mode == Mode::Browse {
             app.ensure_detail_loaded();
         }
-        // Surface progress/completion from background domain backups.
+        // Surface progress/completion from background domain backups and migrations.
         if let Some(status) = app.backups.poll() {
+            app.status = Some(status);
+        }
+        if let Some(status) = app.migrations.poll() {
             app.status = Some(status);
         }
         // Fire the debounced server search once typing has settled (never per keystroke).
@@ -1265,6 +1345,10 @@ fn handle_paste(app: &mut App, text: String) -> anyhow::Result<bool> {
             OverlayResult::RunMigration => {
                 app.overlay = None;
                 app.run_migration();
+            }
+            OverlayResult::RunDomainMigration => {
+                app.overlay = None;
+                app.start_domain_migration();
             }
         }
         return Ok(false);
@@ -1412,7 +1496,7 @@ fn update_offsets(app: &mut App, area: Rect) {
 /// Rebase `dn` from `from_base` onto `to_base` (a case-insensitive suffix swap):
 /// `uid=x,ou=users,dc=A` with bases `dc=A`→`dc=B` becomes `uid=x,ou=users,dc=B`. If
 /// `dn` isn't under `from_base`, it's returned unchanged.
-fn rebase_dn(dn: &str, from_base: &str, to_base: &str) -> String {
+pub(crate) fn rebase_dn(dn: &str, from_base: &str, to_base: &str) -> String {
     if dn.len() >= from_base.len()
         && dn[dn.len() - from_base.len()..].eq_ignore_ascii_case(from_base)
     {
@@ -1436,6 +1520,7 @@ fn handle_rail_key(app: &mut App, key: KeyCode) -> anyhow::Result<bool> {
         Char('m') => app.rail_toggle_mark(),
         Char('M') => app.rail_cycle_mode(),
         Char('b') => app.rail_backup(),
+        Char('C') => app.rail_migrate_domain(),
         Char('N') => app.rail_new_domain(),
         Char('D') => app.rail_delete_domain(),
         Char('s') => { if let Some(idx) = app.rail_template_session() { app.enter_schema(idx); } }
@@ -1498,6 +1583,10 @@ fn handle_key(
             OverlayResult::RunMigration => {
                 app.overlay = None;
                 app.run_migration();
+            }
+            OverlayResult::RunDomainMigration => {
+                app.overlay = None;
+                app.start_domain_migration();
             }
         }
         return Ok(false);

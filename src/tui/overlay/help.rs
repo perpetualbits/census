@@ -33,6 +33,8 @@ const MANUAL: &[&str] = &[
     "  M              cycle a connection's mode: read-only ○ → write ● → dry-run ✎",
     "                 (enabling writes asks y/n first). ◀ marks the focused domain.",
     "  b              back up the cursored domain to an LDIF file (in the working dir)",
+    "  C              migrate the cursored domain's WHOLE subtree to the marked write",
+    "                 targets (background; DNs rebased, existing entries skipped)",
     "  N              create a new domain on this server (write mode; 389-DS, or OpenLDAP",
     "                  with config_bind_dn + provision_cmd — census reviews the host commands)",
     "  D              delete the cursored domain (type the suffix to confirm)",
