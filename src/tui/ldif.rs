@@ -111,6 +111,20 @@ pub fn entry_ldif(
     s
 }
 
+/// An RFC 2849 content record straight from raw attribute bytes (as
+/// [`LdapClient::read_entry_raw`](crate::ldap::client::LdapClient::read_entry_raw)
+/// returns them) — for a dry-run migration preview.
+pub fn entry_ldif_raw(dn: &str, attrs: &[(String, Vec<Vec<u8>>)]) -> String {
+    let mut s = format!("{}\n", attr_line("dn", dn.as_bytes()));
+    for (attr, vals) in attrs {
+        for v in vals {
+            s.push_str(&attr_line(attr, v));
+            s.push('\n');
+        }
+    }
+    s
+}
+
 // ── record shapes ────────────────────────────────────────────────────────────
 
 fn modify(dn: &str, op: &str, body: &[String]) -> String {

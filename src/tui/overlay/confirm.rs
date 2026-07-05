@@ -22,6 +22,8 @@ enum Outcome {
     DeleteDomain { session_idx: usize },
     /// Run the pending host-provisioning plan (OpenLDAP domain create/delete).
     RunProvision,
+    /// Run the pending migration (copy an entry to the marked connections).
+    RunMigration,
 }
 
 pub struct ConfirmDialog {
@@ -71,12 +73,24 @@ impl ConfirmDialog {
         }
     }
 
+    /// A `y/N` review of a pending migration (which entry, to which targets).
+    pub fn review_migration(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            kind: ConfirmKind::YesNo,
+            typed: String::new(),
+            cursor: 0,
+            outcome: Outcome::RunMigration,
+        }
+    }
+
     /// The result to emit once confirmed.
     fn confirmed(&self) -> OverlayResult {
         match &self.outcome {
             Outcome::Act(a) => OverlayResult::Commit(a.clone()),
             Outcome::DeleteDomain { session_idx } => OverlayResult::DeleteDomain { session_idx: *session_idx },
             Outcome::RunProvision => OverlayResult::RunProvision,
+            Outcome::RunMigration => OverlayResult::RunMigration,
         }
     }
 

@@ -88,6 +88,9 @@ pub enum OverlayResult {
     /// Close the modal and run the app's pending host-provisioning plan (OpenLDAP
     /// domain create/delete: the FS step + the cn=config LDAP steps).
     RunProvision,
+    /// Close the modal and run the app's pending migration (copy an entry to the
+    /// marked connections).
+    RunMigration,
 }
 
 /// The set of modal dialogs. One is active at a time via `App::overlay`.

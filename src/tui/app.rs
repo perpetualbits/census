@@ -99,6 +99,15 @@ struct ProvisionPlan {
     fs_script: String,  // the mkdir+chown to run on the host
 }
 
+/// A pending entry migration: copy `dn` from the focused connection (`source`) to each
+/// `target` connection, rebasing the DN onto the target's base. Held until confirmed.
+struct MigrationPlan {
+    source: usize,
+    targets: Vec<usize>,
+    dn: String,
+    label: String,
+}
+
 pub struct App {
     sessions: Vec<Session>,
     /// The connection whose data fills the workspace (its browse/DIT/detail live in the
@@ -119,6 +128,8 @@ pub struct App {
     pending_mode: Option<(usize, ConnMode)>,
     /// A host-provisioning plan awaiting the operator's review/confirmation.
     pending_provision: Option<ProvisionPlan>,
+    /// A migration awaiting the operator's review/confirmation.
+    pending_migration: Option<MigrationPlan>,
     /// In-flight domain backups (LDIF export) running on background threads.
     backups: Backups,
     mode:     Mode,
@@ -208,6 +219,7 @@ impl App {
             rail_rows: Vec::new(),
             pending_mode: None,
             pending_provision: None,
+            pending_migration: None,
             backups: Backups::new(),
             browse, browse_sort_attr,
             groups_cur: ListCursor::new(),
@@ -601,6 +613,68 @@ impl App {
             self.remove_session(t);
         }
         Ok(format!("deleted domain {suffix}"))
+    }
+
+    // ── migration (Phase 3) ──────────────────────────────────────────────────
+
+    /// C (browse): copy the selected user from the focused connection (source) to the
+    /// marked, writable connections (targets), rebasing its DN onto each target's base.
+    /// Shows a review confirm first.
+    fn prepare_migration(&mut self) {
+        let Some(user) = self.browse.snapshot.selected_user() else {
+            self.status = Some(("no user selected to copy".into(), true));
+            return;
+        };
+        let (dn, label) = (user.dn.clone(), user.uid.clone());
+        let source = self.focused;
+        let mut targets: Vec<usize> = self.marked.iter().copied()
+            .filter(|&t| t != source && t < self.sessions.len() && self.sessions[t].mode.can_write())
+            .collect();
+        targets.sort_unstable();
+        if targets.is_empty() {
+            self.status = Some(("mark writable target connection(s) with `m` in the rail (the focused one is the source)".into(), true));
+            return;
+        }
+        let names: Vec<String> = targets.iter().map(|&t| self.sessions[t].label()).collect();
+        let prompt = format!(
+            "Copy {label}\nfrom {}\nto {} marked target(s):\n  {}\n\n(writes to write targets; previews on dry-run)\n\nProceed?",
+            self.sessions[source].label(), targets.len(), names.join("\n  "));
+        self.pending_migration = Some(MigrationPlan { source, targets, dn, label });
+        self.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::review_migration(prompt)));
+    }
+
+    /// Run the confirmed migration: read the entry once from the source, then re-create
+    /// it (DN rebased) at each target — writing on write targets, previewing on dry-run.
+    fn run_migration(&mut self) {
+        let Some(plan) = self.pending_migration.take() else { return; };
+        let source_base = self.sessions[plan.source].client.base_dn.clone();
+        let raw = match self.sessions[plan.source].client.read_entry_raw(&plan.dn) {
+            Ok(r) => r,
+            Err(e) => { self.status = Some((format!("read {} failed: {e:#}", plan.label), true)); return; }
+        };
+        let (mut written, mut previewed, mut failed) = (0u32, 0u32, 0u32);
+        let mut first_err: Option<String> = None;
+        for &t in &plan.targets {
+            let target_base = self.sessions[t].client.base_dn.clone();
+            let new_dn = rebase_dn(&plan.dn, &source_base, &target_base);
+            match self.sessions[t].mode {
+                ConnMode::DryRun => {
+                    let dst = self.sessions[t].label();
+                    let l = ldif::entry_ldif_raw(&new_dn, &raw);
+                    self.journal.note(&format!("[dry-run] copy {} → {dst}", plan.label), &l);
+                    previewed += 1;
+                }
+                ConnMode::Write => match self.sessions[t].client.add_raw(&new_dn, &raw) {
+                    Ok(()) => written += 1,
+                    Err(e) => { failed += 1; first_err.get_or_insert_with(|| format!("{e:#}")); }
+                },
+                ConnMode::ReadOnly => {}
+            }
+        }
+        let mut msg = format!("copied {}: {written} written", plan.label);
+        if previewed > 0 { msg += &format!(", {previewed} previewed (L to view)"); }
+        if failed > 0 { msg += &format!(", {failed} failed — {}", first_err.unwrap_or_default()); }
+        self.status = Some((msg, failed > 0));
     }
 
     /// D: confirm-and-delete the cursored domain (389-DS + Write; never the last one).
@@ -1171,6 +1245,10 @@ fn handle_paste(app: &mut App, text: String) -> anyhow::Result<bool> {
                 app.overlay = None;
                 app.execute_provision();
             }
+            OverlayResult::RunMigration => {
+                app.overlay = None;
+                app.run_migration();
+            }
         }
         return Ok(false);
     }
@@ -1314,6 +1392,19 @@ fn update_offsets(app: &mut App, area: Rect) {
 
 // ─── key handling ────────────────────────────────────────────────────────────
 
+/// Rebase `dn` from `from_base` onto `to_base` (a case-insensitive suffix swap):
+/// `uid=x,ou=users,dc=A` with bases `dc=A`→`dc=B` becomes `uid=x,ou=users,dc=B`. If
+/// `dn` isn't under `from_base`, it's returned unchanged.
+fn rebase_dn(dn: &str, from_base: &str, to_base: &str) -> String {
+    if dn.len() >= from_base.len()
+        && dn[dn.len() - from_base.len()..].eq_ignore_ascii_case(from_base)
+    {
+        format!("{}{}", &dn[..dn.len() - from_base.len()], to_base)
+    } else {
+        dn.to_string()
+    }
+}
+
 /// Key handling while the connections rail holds focus: navigate the server→domain
 /// tree, focus a domain, mark connections, and cycle a connection's mode.
 fn handle_rail_key(app: &mut App, key: KeyCode) -> anyhow::Result<bool> {
@@ -1387,6 +1478,10 @@ fn handle_key(
                 app.overlay = None;
                 app.execute_provision();
             }
+            OverlayResult::RunMigration => {
+                app.overlay = None;
+                app.run_migration();
+            }
         }
         return Ok(false);
     }
@@ -1443,6 +1538,7 @@ fn handle_key(
             (_, Char('t')) => { app.mode = Mode::Dit; app.enter_dit(); }
             (_, Char('n')) => open_new_user(app),
             (_, Char('D')) => open_delete_user(app),
+            (_, Char('C')) => app.prepare_migration(),
             (_, Tab) | (_, BackTab) => {
                 app.browse_focus =
                     if app.browse_focus == Pane::Left { Pane::Right } else { Pane::Left };
@@ -2400,6 +2496,25 @@ mod search_tests {
             gid_number: gid, members: Vec::new(),
             dup_name: false, dup_gid: false, attrs: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn rebase_dn_swaps_the_base_suffix() {
+        // The RDN chain above the base is preserved; only the base suffix changes.
+        assert_eq!(
+            rebase_dn("uid=ada,ou=users,dc=alpha,dc=test", "dc=alpha,dc=test", "dc=bravo,dc=test"),
+            "uid=ada,ou=users,dc=bravo,dc=test"
+        );
+        // The source base match is case-insensitive (DNs aren't case-sensitive in the suffix).
+        assert_eq!(
+            rebase_dn("uid=ada,ou=users,DC=Alpha,DC=Test", "dc=alpha,dc=test", "dc=bravo,dc=test"),
+            "uid=ada,ou=users,dc=bravo,dc=test"
+        );
+        // A DN not under the source base is left untouched.
+        assert_eq!(
+            rebase_dn("uid=ada,dc=other", "dc=alpha,dc=test", "dc=bravo,dc=test"),
+            "uid=ada,dc=other"
+        );
     }
 
     #[test]
