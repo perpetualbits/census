@@ -32,6 +32,11 @@ if [ -z "$(ls -A /etc/ldap/slapd.d 2>/dev/null || true)" ]; then
         echo "moduleload sssvlv"
         echo "sizelimit unlimited"
         echo "timelimit unlimited"
+        # A cn=config admin so census can manage schema (olcAttributeTypes /
+        # olcObjectClasses) over LDAP by binding as cn=admin,cn=config.
+        echo "database config"
+        echo "rootdn   \"cn=admin,cn=config\""
+        echo "rootpw   $ADMIN_PW"
         for suffix in $DOMAINS; do
             dir="/var/lib/ldap/$(be_of "$suffix")"
             mkdir -p "$dir"; chown openldap:openldap "$dir"

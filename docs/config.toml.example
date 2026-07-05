@@ -19,6 +19,13 @@ bind_dn   = "cn=admin,dc=example,dc=com"
 # sni     = "ldap.example.com"        # TLS SNI override (default: host)
 verify    = true                       # require valid TLS certificate
 
+# Managing an OpenLDAP server's SCHEMA (adding attributeTypes/objectClasses in the
+# schema view) needs a cn=config admin — OpenLDAP keeps schema under cn=config, which
+# the data bind above can't reach. Set these to enable it. (389 Directory Server
+# doesn't need this — it uses the admin bind for schema.)
+# config_bind_dn      = "cn=admin,cn=config"
+# config_password_cmd = "rbw get 'My LDAP cn=config'"
+
 # How password changes are written:
 #   "exop"  → RFC 3062 Password Modify; the server hashes per its policy (default)
 #   "crypt" → census writes userPassword: {CRYPT}$6$… (client-side SHA-512)

@@ -70,6 +70,12 @@ pub struct ServerConfig {
     /// Shell command whose stdout is the bind password (e.g. `rbw get "My LDAP"`).
     /// Preferred over CENSUS_BIND_PASSWORD env var; both beat interactive prompt.
     pub password_cmd: Option<String>,
+    /// A `cn=config` admin (e.g. `cn=admin,cn=config`) and its password command, for
+    /// managing an **OpenLDAP** server's schema — which lives under `cn=config`,
+    /// unreachable via the data bind. Only needed to add schema on OpenLDAP (389-DS
+    /// uses the Directory Manager). Leave unset otherwise.
+    pub config_bind_dn: Option<String>,
+    pub config_password_cmd: Option<String>,
     /// TLS SNI / certificate name override. Reserved for verified tunnel
     /// connections; not consulted by the rustls path yet.
     #[allow(dead_code)]

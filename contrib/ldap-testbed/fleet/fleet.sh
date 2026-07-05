@@ -105,6 +105,12 @@ confd() {
             echo "bind_dn      = \"$bind\""
             echo "password_cmd = \"$pwcmd\""
             echo "verify       = false"
+            # OpenLDAP schema lives under cn=config — give census a config admin so
+            # `a`/`o` in the schema view work here too.
+            if [ "$brand" = openldap ]; then
+                echo "config_bind_dn      = \"cn=admin,cn=config\""
+                echo "config_password_cmd = \"printf $OL_PW\""
+            fi
             for suffix in $rest; do
                 echo ""
                 echo "[[domain]]"

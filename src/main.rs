@@ -74,8 +74,12 @@ fn main() -> anyhow::Result<()> {
             .or_insert_with(|| get_password(&ec.cfg))
             .clone();
         let mode = resolve_mode(args.write, args.dry_run, &ec);
+        // Resolve the optional cn=config admin password (OpenLDAP schema management).
+        let config_password = ec.cfg.server.config_bind_dn.as_ref()
+            .and(ec.cfg.server.config_password_cmd.as_deref())
+            .and_then(|cmd| run_password_cmd(cmd).ok());
         let label = format!("{} · {}", ec.server_label, ec.domain_label);
-        match Session::connect(ec.cfg, password, pw_source, mode, ec.server_label, ec.domain_label) {
+        match Session::connect(ec.cfg, password, config_password, pw_source, mode, ec.server_label, ec.domain_label) {
             Ok(session) => sessions.push(session),
             // With several connections configured, one bad/unreachable directory must
             // not sink the rest — warn and skip it. (A dedicated "failed connection"

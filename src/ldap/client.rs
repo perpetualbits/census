@@ -480,27 +480,59 @@ impl LdapClient {
         Ok(out)
     }
 
-    /// Add a schema element — an `attributeTypes` or `objectClasses` definition — to
-    /// the subschema entry. **389-DS only** (the Directory Manager can modify
-    /// `cn=schema`); OpenLDAP keeps schema under `cn=config`, unreachable over the data
-    /// connection. `definition` is the full RFC 4512 string; the server validates it.
+    /// Add a schema element — an attributeType or objectClass definition — to the
+    /// server. `definition` is the full RFC 4512 string; the server validates it.
+    ///
+    /// - **389-DS:** modify-add `attributeTypes`/`objectClasses` on `cn=schema`
+    ///   (Directory Manager can write it directly).
+    /// - **OpenLDAP:** schema lives under `cn=config`, so **this client must be bound
+    ///   as a `cn=config` admin** (census opens a separate config-bound connection for
+    ///   this). census keeps its additions in one dedicated `cn=census-custom` schema
+    ///   entry: find it and modify-add, or create it. (OpenLDAP allows adding schema
+    ///   dynamically but not deleting it — removal needs a config edit + restart.)
     pub fn add_schema(&mut self, kind: SchemaKind, definition: &str) -> anyhow::Result<()> {
-        if self.brand != Brand::Ds389 {
-            anyhow::bail!(
-                "adding schema over LDAP needs 389 Directory Server (this is {}); \
-                 OpenLDAP schema lives under cn=config, which the data connection can't reach",
-                self.brand.label()
-            );
+        let def = definition.trim();
+        match self.brand {
+            Brand::Ds389 => {
+                let attr = match kind {
+                    SchemaKind::Attribute => "attributeTypes",
+                    SchemaKind::ObjectClass => "objectClasses",
+                };
+                let dn = self.subschema_dn()?;
+                self.conn.modify(&dn, vec![Mod::Add(attr, HashSet::from([def]))])
+                    .context("schema modify")?
+                    .success().context("schema modify rejected")?;
+            }
+            Brand::OpenLdap => {
+                let attr = match kind {
+                    SchemaKind::Attribute => "olcAttributeTypes",
+                    SchemaKind::ObjectClass => "olcObjectClasses",
+                };
+                // Our single schema entry is stored as cn={N}census-custom; search by
+                // substring (the {N} prefix is added by slapd), then modify-add — or
+                // create it if this is the first addition.
+                let found = self.conn
+                    .search("cn=schema,cn=config", Scope::OneLevel, "(cn=*census-custom*)", vec!["1.1"])
+                    .context("schema search (needs a cn=config admin bind)")?
+                    .0.into_iter().next().map(|e| SearchEntry::construct(e).dn);
+                match found {
+                    Some(dn) => {
+                        self.conn.modify(&dn, vec![Mod::Add(attr, HashSet::from([def]))])
+                            .context("schema modify")?
+                            .success().context("schema modify rejected")?;
+                    }
+                    None => {
+                        self.conn.add("cn=census-custom,cn=schema,cn=config", vec![
+                            ("objectClass", HashSet::from(["olcSchemaConfig"])),
+                            ("cn", HashSet::from(["census-custom"])),
+                            (attr, HashSet::from([def])),
+                        ]).context("schema add")?
+                          .success().context("schema add rejected")?;
+                    }
+                }
+            }
+            Brand::Other => anyhow::bail!("adding schema isn't supported on this server brand"),
         }
-        let attr = match kind {
-            SchemaKind::Attribute => "attributeTypes",
-            SchemaKind::ObjectClass => "objectClasses",
-        };
-        let dn = self.subschema_dn()?;
-        self.conn
-            .modify(&dn, vec![Mod::Add(attr, HashSet::from([definition.trim()]))])
-            .context("schema modify")?
-            .success().context("schema modify rejected")?;
         Ok(())
     }
 

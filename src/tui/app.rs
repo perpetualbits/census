@@ -9,7 +9,7 @@ use mullion::{
 };
 
 use crate::config::ConnMode;
-use crate::ldap::client::{Brand, DitNode, Group, SchemaElem, SchemaKind, User};
+use crate::ldap::client::{Brand, DitNode, Group, LdapClient, SchemaElem, SchemaKind, User};
 use crate::session::Session;
 
 use super::backup::Backups;
@@ -448,13 +448,13 @@ impl App {
             return;
         }
         // Connect the new domain as its own session, sharing the server's cfg/secret.
-        let (mut cfg, password, pw_source, server_label) = {
+        let (mut cfg, password, config_password, pw_source, server_label) = {
             let t = &self.sessions[template_idx];
-            (t.cfg.clone(), t.password.clone(), t.conn.password.clone(), t.server_label.clone())
+            (t.cfg.clone(), t.password.clone(), t.config_password.clone(), t.conn.password.clone(), t.server_label.clone())
         };
         cfg.server.base_dn = suffix.to_string();
         let domain_label = crate::config::domain_label(suffix);
-        match Session::connect(cfg, password, pw_source, ConnMode::Write, server_label.clone(), domain_label) {
+        match Session::connect(cfg, password, config_password, pw_source, ConnMode::Write, server_label.clone(), domain_label) {
             Ok(sess) => {
                 self.sessions.push(sess);
                 self.session_ui.push(SessionUi::default());
@@ -565,14 +565,21 @@ impl App {
     pub fn schema_filtering(&self) -> bool { self.schema_filtering }
     pub fn schema_title(&self) -> &str { &self.schema_title }
 
-    /// a / o: prompt to add an attributeType / objectClass (389-DS + Write).
+    /// a / o: prompt to add an attributeType / objectClass. 389-DS uses the Directory
+    /// Manager; OpenLDAP needs `config_bind_dn`/`config_password_cmd` in the config.
     fn open_add_schema(&mut self, kind: SchemaKind) {
         let idx = self.schema_session;
         if idx >= self.sessions.len() { return; }
         let s = &self.sessions[idx];
-        if s.client.brand() != Brand::Ds389 {
-            self.status = Some((format!(
-                "adding schema over LDAP needs 389-DS (this server is {})", s.client.brand().label()), true));
+        let brand = s.client.brand();
+        let supported = brand == Brand::Ds389
+            || (brand == Brand::OpenLdap && s.cfg.server.config_bind_dn.is_some());
+        if !supported {
+            self.status = Some((if brand == Brand::OpenLdap {
+                "set config_bind_dn / config_password_cmd for this OpenLDAP server to add schema".into()
+            } else {
+                format!("adding schema over LDAP isn't supported on {}", brand.label())
+            }, true));
             return;
         }
         if s.mode != ConnMode::Write {
@@ -583,12 +590,19 @@ impl App {
     }
 
     /// Add a schema definition to `session_idx`'s server, then refresh the browser.
+    /// OpenLDAP's schema lives under cn=config, so that path binds a separate config
+    /// admin from the session's `config_*` creds.
     fn do_add_schema(&mut self, session_idx: usize, kind: SchemaKind, definition: &str) {
         if session_idx >= self.sessions.len() || self.sessions[session_idx].mode != ConnMode::Write {
             self.status = Some(("connection is read-only".into(), true));
             return;
         }
-        match self.sessions[session_idx].client.add_schema(kind, definition) {
+        let result = if self.sessions[session_idx].client.brand() == Brand::OpenLdap {
+            self.openldap_add_schema(session_idx, kind, definition)
+        } else {
+            self.sessions[session_idx].client.add_schema(kind, definition)
+        };
+        match result {
             Ok(()) => {
                 if self.mode == Mode::Schema && self.schema_session == session_idx {
                     if let Ok(elems) = self.sessions[session_idx].client.read_schema() {
@@ -600,6 +614,20 @@ impl App {
             }
             Err(e) => self.status = Some((format!("add schema failed: {e:#}"), true)),
         }
+    }
+
+    /// Add schema on an OpenLDAP server via a short-lived `cn=config`-admin connection
+    /// (its schema lives under cn=config, which the data bind can't write).
+    fn openldap_add_schema(&self, idx: usize, kind: SchemaKind, definition: &str) -> anyhow::Result<()> {
+        let s = &self.sessions[idx];
+        let config_bind = s.cfg.server.config_bind_dn.clone()
+            .ok_or_else(|| anyhow::anyhow!("no config_bind_dn set for this OpenLDAP server"))?;
+        let mut cfg = s.cfg.clone();
+        cfg.server.bind_dn = Some(config_bind);
+        let mut client = LdapClient::connect(&cfg, s.config_password.as_deref())?;
+        let r = client.add_schema(kind, definition);
+        client.close().ok();
+        r
     }
 
     /// Rebuild the flattened rail: each server group (in first-seen order) followed by

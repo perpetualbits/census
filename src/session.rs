@@ -24,6 +24,9 @@ pub struct Session {
     /// per-session browse worker can be (re)spawned on focus (see `tui::browse`).
     pub cfg: Config,
     pub password: Option<String>,
+    /// Resolved `cn=config` admin password (for OpenLDAP schema management), if the
+    /// server config provides `config_bind_dn` / `config_password_cmd`.
+    pub config_password: Option<String>,
     /// Per-connection write posture (read-only / write / dry-run).
     pub mode: ConnMode,
     /// Rail labels: the server (grouping) and the domain (leaf).
@@ -35,9 +38,11 @@ pub struct Session {
 
 impl Session {
     /// Connect, bind, and load the initial user/group caches for one domain.
+    #[allow(clippy::too_many_arguments)]
     pub fn connect(
         cfg: Config,
         password: Option<String>,
+        config_password: Option<String>,
         pw_source: PwSource,
         mode: ConnMode,
         server_label: String,
@@ -52,7 +57,7 @@ impl Session {
         let (groups, groups_truncated) = client.list_groups()?;
         Ok(Self {
             client, caps, users, groups, users_truncated, groups_truncated, conn,
-            cfg, password, mode, server_label, domain_label,
+            cfg, password, config_password, mode, server_label, domain_label,
         })
     }
 
