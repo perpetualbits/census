@@ -34,6 +34,7 @@ const MANUAL: &[&str] = &[
     "                 (enabling writes asks y/n first). ◀ marks the focused domain.",
     "  b              back up the cursored domain to an LDIF file (in the working dir)",
     "  N              create a new domain on this server (389-DS; connection must be write)",
+    "  D              delete the cursored domain (389-DS; type the suffix to confirm)",
     "",
     "# Search  (/)",
     "  Type to filter users and groups live; matches come from first/last name,",

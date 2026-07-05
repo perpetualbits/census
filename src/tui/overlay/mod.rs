@@ -79,6 +79,9 @@ pub enum OverlayResult {
     /// `template_idx` (handled outside the `Action`/undo machinery — it manages
     /// sessions, not entries).
     CreateDomain { template_idx: usize, suffix: String },
+    /// Close the modal and delete the domain that session `session_idx` is connected
+    /// to, then drop that session from the rail.
+    DeleteDomain { session_idx: usize },
 }
 
 /// The set of modal dialogs. One is active at a time via `App::overlay`.

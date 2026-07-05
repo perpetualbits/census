@@ -15,17 +15,24 @@ pub enum ConfirmKind {
     TypedDn { expected: String },
 }
 
+/// What a confirmation commits: a normal entry [`Action`], or a domain deletion
+/// (handled off the `Action`/undo path, since it drops a whole naming context + session).
+enum Outcome {
+    Act(Action),
+    DeleteDomain { session_idx: usize },
+}
+
 pub struct ConfirmDialog {
     prompt: String,
     kind: ConfirmKind,
     typed: String,
     cursor: usize,
-    action: Action,
+    outcome: Outcome,
 }
 
 impl ConfirmDialog {
     pub fn yes_no(prompt: impl Into<String>, action: Action) -> Self {
-        Self { prompt: prompt.into(), kind: ConfirmKind::YesNo, typed: String::new(), cursor: 0, action }
+        Self { prompt: prompt.into(), kind: ConfirmKind::YesNo, typed: String::new(), cursor: 0, outcome: Outcome::Act(action) }
     }
 
     pub fn typed_dn(prompt: impl Into<String>, expected: impl Into<String>, action: Action) -> Self {
@@ -34,7 +41,27 @@ impl ConfirmDialog {
             kind: ConfirmKind::TypedDn { expected: expected.into() },
             typed: String::new(),
             cursor: 0,
-            action,
+            outcome: Outcome::Act(action),
+        }
+    }
+
+    /// Confirm deleting the domain that session `session_idx` is on — the operator must
+    /// type the suffix exactly.
+    pub fn delete_domain(prompt: impl Into<String>, suffix: impl Into<String>, session_idx: usize) -> Self {
+        Self {
+            prompt: prompt.into(),
+            kind: ConfirmKind::TypedDn { expected: suffix.into() },
+            typed: String::new(),
+            cursor: 0,
+            outcome: Outcome::DeleteDomain { session_idx },
+        }
+    }
+
+    /// The result to emit once confirmed.
+    fn confirmed(&self) -> OverlayResult {
+        match &self.outcome {
+            Outcome::Act(a) => OverlayResult::Commit(a.clone()),
+            Outcome::DeleteDomain { session_idx } => OverlayResult::DeleteDomain { session_idx: *session_idx },
         }
     }
 
@@ -42,14 +69,14 @@ impl ConfirmDialog {
         use KeyCode::*;
         match &self.kind {
             ConfirmKind::YesNo => match key {
-                Char('y') | Char('Y') => OverlayResult::Commit(self.action.clone()),
+                Char('y') | Char('Y') => self.confirmed(),
                 _ => OverlayResult::Cancel,
             },
             ConfirmKind::TypedDn { expected } => match key {
                 Esc => OverlayResult::Cancel,
                 Enter => {
                     if &self.typed == expected {
-                        OverlayResult::Commit(self.action.clone())
+                        self.confirmed()
                     } else {
                         OverlayResult::Stay
                     }

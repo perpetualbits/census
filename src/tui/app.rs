@@ -448,6 +448,66 @@ impl App {
         }
     }
 
+    /// D: confirm-and-delete the cursored domain (389-DS + Write; never the last one).
+    fn rail_delete_domain(&mut self) {
+        let Some(idx) = self.rail_rows.get(self.rail_cur.cursor).and_then(|r| r.session_idx) else {
+            self.status = Some(("move the cursor onto a domain to delete it".into(), true));
+            return;
+        };
+        if self.sessions.len() <= 1 {
+            self.status = Some(("can't delete the only connection".into(), true));
+            return;
+        }
+        let s = &self.sessions[idx];
+        if s.client.brand() != Brand::Ds389 {
+            self.status = Some((format!(
+                "deleting a domain over LDAP needs 389-DS (this server is {})", s.client.brand().label()), true));
+            return;
+        }
+        if s.mode != ConnMode::Write {
+            self.status = Some(("set this connection to write (M) before deleting the domain".into(), true));
+            return;
+        }
+        let suffix = s.client.base_dn.clone();
+        self.overlay = Some(Overlay::Confirm(overlay::ConfirmDialog::delete_domain(
+            format!("Delete domain {suffix} and unmap ALL its entries?"),
+            suffix, idx,
+        )));
+    }
+
+    /// Delete the domain session `idx` is connected to, then drop the session.
+    fn do_delete_domain(&mut self, idx: usize) {
+        if idx >= self.sessions.len() || self.sessions.len() <= 1 { return; }
+        let suffix = self.sessions[idx].client.base_dn.clone();
+        if let Err(e) = self.sessions[idx].client.delete_domain(&suffix) {
+            self.status = Some((format!("delete failed: {e:#}"), true));
+            return;
+        }
+        self.remove_session(idx);
+        self.status = Some((format!("deleted domain {suffix}"), false));
+    }
+
+    /// Remove session `target`: move focus off it first (so its live UI state isn't the
+    /// App's), drop it and its stashed state (closing any browse worker), then reindex
+    /// `focused` and the `marked` set for the shift.
+    fn remove_session(&mut self, target: usize) {
+        if target >= self.sessions.len() || self.sessions.len() <= 1 { return; }
+        if self.focused == target {
+            let fallback = if target == 0 { 1 } else { target - 1 };
+            self.focus_session(fallback); // stashes target's live state; focused = fallback
+        }
+        self.sessions.remove(target);
+        self.session_ui.remove(target);
+        if self.focused > target { self.focused -= 1; }
+        let old = std::mem::take(&mut self.marked);
+        self.marked = old.into_iter()
+            .filter(|&m| m != target)
+            .map(|m| if m > target { m - 1 } else { m })
+            .collect();
+        self.rebuild_rail_rows();
+        self.rail_cur.clamp(self.rail_rows.len());
+    }
+
     /// Rebuild the flattened rail: each server group (in first-seen order) followed by
     /// its domain leaves when expanded. Mirrors [`Self::rebuild_dit_rows`].
     fn rebuild_rail_rows(&mut self) {
@@ -825,6 +885,10 @@ fn handle_paste(app: &mut App, text: String) -> anyhow::Result<bool> {
                 app.overlay = None;
                 app.do_create_domain(template_idx, &suffix);
             }
+            OverlayResult::DeleteDomain { session_idx } => {
+                app.overlay = None;
+                app.do_delete_domain(session_idx);
+            }
         }
         return Ok(false);
     }
@@ -973,6 +1037,7 @@ fn handle_rail_key(app: &mut App, key: KeyCode) -> anyhow::Result<bool> {
         Char('M') => app.rail_cycle_mode(),
         Char('b') => app.rail_backup(),
         Char('N') => app.rail_new_domain(),
+        Char('D') => app.rail_delete_domain(),
         _ => {}
     }
     Ok(false)
@@ -1016,6 +1081,10 @@ fn handle_key(
             OverlayResult::CreateDomain { template_idx, suffix } => {
                 app.overlay = None;
                 app.do_create_domain(template_idx, &suffix);
+            }
+            OverlayResult::DeleteDomain { session_idx } => {
+                app.overlay = None;
+                app.do_delete_domain(session_idx);
             }
         }
         return Ok(false);

@@ -385,6 +385,46 @@ impl LdapClient {
         Ok(())
     }
 
+    /// Delete a domain (naming context) `suffix` from this server. **389-DS only.**
+    /// Removes the mapping-tree entry (unmaps the suffix — it stops being served and
+    /// leaves `namingContexts`) then the backend's config subtree. The on-disk database
+    /// files are reclaimed by the server on its next restart. `suffix`'s live entries
+    /// are not walked/deleted first (that could be millions); unmapping makes them
+    /// inaccessible, which is the operator-visible result.
+    pub fn delete_domain(&mut self, suffix: &str) -> anyhow::Result<()> {
+        if self.brand != Brand::Ds389 {
+            anyhow::bail!("deleting a domain over LDAP needs 389 Directory Server (this is {})", self.brand.label());
+        }
+        let suffix = suffix.trim();
+        let be: String = suffix.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let esc = suffix.replace('=', "\\3D").replace(',', "\\2C");
+        // 1. Unmap the suffix.
+        self.conn.delete(&format!("cn={esc},cn=mapping tree,cn=config"))
+            .context("delete mapping tree")?.success().context("delete mapping tree rejected")?;
+        // 2. Remove the backend config subtree (has children → delete depth-first).
+        self.delete_tree(&format!("cn={be},cn=ldbm database,cn=plugins,cn=config"))?;
+        Ok(())
+    }
+
+    /// Delete every entry in the subtree at `dn`, children before parents. Used to tear
+    /// down a 389-DS backend's config subtree (which is non-leaf).
+    fn delete_tree(&mut self, dn: &str) -> anyhow::Result<()> {
+        let res = self.conn
+            .search(dn, Scope::Subtree, "(objectClass=*)", vec!["1.1"])
+            .context("subtree read")?;
+        if !matches!(res.1.rc, 0) {
+            anyhow::bail!("subtree read rejected (rc {})", res.1.rc);
+        }
+        let mut dns: Vec<String> = res.0.into_iter().map(|e| SearchEntry::construct(e).dn).collect();
+        // Deepest first (more RDN components = deeper) so parents delete last.
+        dns.sort_by_key(|d| std::cmp::Reverse(d.matches(',').count()));
+        for d in dns {
+            self.conn.delete(&d).with_context(|| format!("delete {d}"))?
+                .success().with_context(|| format!("delete {d} rejected"))?;
+        }
+        Ok(())
+    }
+
     /// How this client reached the directory (direct vs SSH tunnel), for the UI.
     pub fn conn_via(&self) -> &ConnVia { &self.conn_via }
 
