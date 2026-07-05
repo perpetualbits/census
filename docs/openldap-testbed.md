@@ -192,7 +192,77 @@ seconds.
 
 ---
 
-## 7. Kubernetes / Helm
+## 7. Teardown & cleanup
+
+Two levels: **stop** (remove the running container/pod, keep the data so a
+restart is instant) and **destroy** (also drop the volumes — reclaims the disk
+the mdb database and seed LDIF occupy, several GB at full scale). Use whichever
+matches how you started it.
+
+### A) script
+
+```bash
+cd contrib/ldap-testbed
+./setup.sh down       # stop & remove the container, keep the data volumes
+./setup.sh destroy    # remove the container AND the volumes (seed/conf/data)
+```
+
+`setup.sh` honours the same engine as when you brought it up (`CENSUS_ENGINE`,
+podman by default). It does not delete the built images — see "images" below.
+
+### B) compose
+
+```bash
+cd contrib/ldap-testbed
+podman compose down            # stop & remove containers, keep volumes
+podman compose down -v         # also remove the seed/conf/data volumes
+podman compose down -v --rmi local   # ...and the images this project built
+# (swap `podman compose` for `docker compose` if that's how you started it)
+```
+
+### C) podman kube
+
+`podman kube down` removes the pod but **leaves the PVC-backed volumes** — drop
+those explicitly:
+
+```bash
+cd contrib/ldap-testbed
+podman kube down podman-kube.yaml
+podman volume rm census-seed census-conf census-data   # the PVCs
+```
+
+### Images
+
+Removing volumes reclaims the data; the two built images are separate. Remove
+them only if you don't intend to rebuild soon (a rebuild re-pulls base images):
+
+```bash
+podman rmi localhost/census-ldap:latest localhost/census-ldap-generator:latest
+# docker: docker rmi census-ldap:latest census-ldap-generator:latest
+```
+
+### census config
+
+The test server config is a plain file — delete it if you're done:
+
+```bash
+rm -f ~/.config/census/census-test.toml
+```
+
+### Verify nothing's left
+
+```bash
+podman ps -a       | grep -i census   # no containers
+podman volume ls   | grep -i census   # no seed/conf/data volumes
+podman images      | grep -i census   # no images (if you removed them)
+```
+
+Nothing here writes outside its container, named volumes, and that one census
+config file, so once those three are gone the testbed leaves no trace.
+
+---
+
+## 8. Kubernetes / Helm
 
 `podman-kube.yaml` is a `podman kube play` manifest and a starting point for real
 Kubernetes. To run it on a cluster:
