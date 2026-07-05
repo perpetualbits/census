@@ -9,7 +9,7 @@ use mullion::{
 };
 
 use crate::config::ConnMode;
-use crate::ldap::client::{Brand, DitNode, Group, User};
+use crate::ldap::client::{Brand, DitNode, Group, SchemaElem, User};
 use crate::session::Session;
 
 use super::backup::Backups;
@@ -28,7 +28,7 @@ const RENDER_TICK: Duration = Duration::from_millis(50);
 // ─── state ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode { Browse, GroupSelect, Membership, Dit, Search }
+enum Mode { Browse, GroupSelect, Membership, Dit, Search, Schema }
 
 /// What a [`SearchHit`] points at, so `Enter` can jump to the right screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -130,6 +130,15 @@ pub struct App {
     pub group_detail_cur: usize,
     pub group_detail_scroll: usize,
 
+    // Schema browser (per-server; opened from the rail with `s`).
+    schema_elems: Vec<SchemaElem>,
+    pub schema_cur: ListCursor,
+    pub schema_focus: Pane,
+    schema_filter: String,
+    schema_filtering: bool,     // typing edits the filter (started with `/`)
+    schema_from: Mode,          // mode to return to on Esc
+    schema_title: String,       // "<server> (<brand>)"
+
     // DIT tree browser.
     pub dit_focus: Pane,
     pub dit_cur: ListCursor,
@@ -194,6 +203,13 @@ impl App {
             group_browse_focus: Pane::Left,
             group_detail_cur: 0,
             group_detail_scroll: 0,
+            schema_elems: Vec::new(),
+            schema_cur: ListCursor::new(),
+            schema_focus: Pane::Left,
+            schema_filter: String::new(),
+            schema_filtering: false,
+            schema_from: Mode::Browse,
+            schema_title: String::new(),
             dit_focus: Pane::Left,
             dit_cur: ListCursor::new(),
             dit_detail_cur: 0,
@@ -507,6 +523,44 @@ impl App {
         self.rebuild_rail_rows();
         self.rail_cur.clamp(self.rail_rows.len());
     }
+
+    /// s: open the schema browser for the cursored server (read-only; every brand).
+    fn enter_schema(&mut self, session_idx: usize) {
+        match self.sessions[session_idx].client.read_schema() {
+            Ok(elems) => {
+                self.schema_elems = elems;
+                self.schema_cur = ListCursor::new();
+                self.schema_focus = Pane::Left;
+                self.schema_filter.clear();
+                self.schema_filtering = false;
+                let s = &self.sessions[session_idx];
+                self.schema_title = format!("{} ({})", s.server_label, s.client.brand().label());
+                self.schema_from = self.mode;
+                self.mode = Mode::Schema;
+                self.rail_focused = false; // hand key focus to the schema workspace
+            }
+            Err(e) => self.status = Some((format!("schema read failed: {e:#}"), true)),
+        }
+    }
+
+    /// Indices of the schema elements matching the current filter (name or OID
+    /// substring; all when the filter is empty).
+    fn schema_matches(&self) -> Vec<usize> {
+        let f = self.schema_filter.to_lowercase();
+        self.schema_elems.iter().enumerate()
+            .filter(|(_, e)| f.is_empty() || e.name.to_lowercase().contains(&f) || e.oid.contains(&f))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    // ── schema browser accessors (for screens::schema) ──────────────────────
+    pub fn schema_elems(&self) -> &[SchemaElem] { &self.schema_elems }
+    pub fn schema_rows(&self) -> Vec<usize> { self.schema_matches() }
+    pub fn schema_cursor(&self) -> &ListCursor { &self.schema_cur }
+    pub fn schema_pane(&self) -> Pane { self.schema_focus }
+    pub fn schema_filter(&self) -> &str { &self.schema_filter }
+    pub fn schema_filtering(&self) -> bool { self.schema_filtering }
+    pub fn schema_title(&self) -> &str { &self.schema_title }
 
     /// Rebuild the flattened rail: each server group (in first-seen order) followed by
     /// its domain leaves when expanded. Mirrors [`Self::rebuild_dit_rows`].
@@ -945,6 +999,10 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind) {
         Mode::Search => {
             if down { app.search_cur.down(app.search_hits.len()); } else { app.search_cur.up(); }
         }
+        Mode::Schema => {
+            let n = app.schema_matches().len();
+            if down { app.schema_cur.down(n); } else { app.schema_cur.up(); }
+        }
     }
 }
 
@@ -972,6 +1030,12 @@ fn update_offsets(app: &mut App, area: Rect) {
     let nrail = app.rail_rows.len();
     app.rail_cur.clamp(nrail);
     app.rail_cur.keep_in_view(nrail, vis);
+
+    // Schema browser list (minus the filter line + separator).
+    let nschema = app.schema_matches().len();
+    let schema_vis = vis.saturating_sub(1).max(1);
+    app.schema_cur.clamp(nschema);
+    app.schema_cur.keep_in_view(nschema, schema_vis);
 
     // Search results list uses the whole inner area minus the query line + separator.
     let nsearch = app.search_hits.len();
@@ -1038,6 +1102,7 @@ fn handle_rail_key(app: &mut App, key: KeyCode) -> anyhow::Result<bool> {
         Char('b') => app.rail_backup(),
         Char('N') => app.rail_new_domain(),
         Char('D') => app.rail_delete_domain(),
+        Char('s') => { if let Some(idx) = app.rail_template_session() { app.enter_schema(idx); } }
         _ => {}
     }
     Ok(false)
@@ -1120,7 +1185,7 @@ fn handle_key(
 
     // `/` opens cross-directory search from any screen (read-only; no write gate).
     // Suppressed while already searching, so `/` is a literal query character there.
-    if key == Char('/') && app.mode != Mode::Search {
+    if key == Char('/') && app.mode != Mode::Search && app.mode != Mode::Schema {
         app.open_search();
         return Ok(false);
     }
@@ -1283,6 +1348,34 @@ fn handle_key(
                 }
             }
         },
+
+        Mode::Schema => {
+            let n = app.schema_matches().len();
+            if app.schema_filtering {
+                // Editing the filter: type to narrow, Enter/Esc to stop editing.
+                match key {
+                    Esc | Enter => app.schema_filtering = false,
+                    Backspace => { app.schema_filter.pop(); app.schema_cur.cursor = 0; }
+                    Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                        app.schema_filter.push(c); app.schema_cur.cursor = 0;
+                    }
+                    _ => {}
+                }
+            } else {
+                match (app.schema_focus, key) {
+                    (_, Char('q')) => return Ok(true),
+                    (_, Esc) => app.mode = app.schema_from,
+                    (_, Char('/')) => app.schema_filtering = true,
+                    (_, Tab) | (_, BackTab) =>
+                        app.schema_focus = if app.schema_focus == Pane::Left { Pane::Right } else { Pane::Left },
+                    (Pane::Left, Up   | Char('k')) => app.schema_cur.up(),
+                    (Pane::Left, Down | Char('j')) => app.schema_cur.down(n),
+                    (Pane::Left, PageUp)   => app.schema_cur.page(-10, n),
+                    (Pane::Left, PageDown) => app.schema_cur.page(10, n),
+                    _ => {}
+                }
+            }
+        }
     }
     Ok(false)
 }
@@ -1951,6 +2044,7 @@ fn render(app: &App, buf: &mut Buffer) {
         Mode::Membership  => screens::groups::render_membership(app, buf, workspace),
         Mode::Dit         => screens::dit::render(app, buf, workspace),
         Mode::Search      => screens::search::render(app, buf, workspace),
+        Mode::Schema      => screens::schema::render(app, buf, workspace),
     }
     if let Some(pa) = preview {
         screens::preview::render(app, buf, pa);

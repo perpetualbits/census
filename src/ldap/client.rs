@@ -49,6 +49,25 @@ impl Brand {
     }
 }
 
+/// One schema definition read from the subschema entry.
+#[derive(Debug, Clone)]
+pub struct SchemaElem {
+    pub kind: SchemaKind,
+    /// Primary NAME (or the OID when unnamed).
+    pub name: String,
+    pub oid: String,
+    /// The full RFC 4512 definition string.
+    pub raw: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaKind { Attribute, ObjectClass }
+
+impl SchemaKind {
+    /// One-letter marker for the list.
+    pub fn marker(self) -> char { match self { SchemaKind::Attribute => 'A', SchemaKind::ObjectClass => 'O' } }
+}
+
 pub struct LdapClient {
     conn: LdapConn,
     pub base_dn: String,
@@ -423,6 +442,36 @@ impl LdapClient {
                 .success().with_context(|| format!("delete {d} rejected"))?;
         }
         Ok(())
+    }
+
+    /// Read the server's schema — every `attributeTypes` and `objectClasses`
+    /// definition from the subschema entry (found via the rootDSE's
+    /// `subschemaSubentry`). Read-only; works on every brand. Sorted by name.
+    pub fn read_schema(&mut self) -> anyhow::Result<Vec<SchemaElem>> {
+        let sub_dn = self.conn
+            .search("", Scope::Base, "(objectClass=*)", vec!["subschemaSubentry"])
+            .context("rootDSE read")?
+            .success().context("rootDSE rejected")?
+            .0.into_iter().next().map(SearchEntry::construct)
+            .and_then(|e| e.attrs.get("subschemaSubentry").and_then(|v| v.first()).cloned())
+            .unwrap_or_else(|| "cn=subschema".to_string());
+
+        let entry = self.conn
+            .search(&sub_dn, Scope::Base, "(objectClass=*)", vec!["attributeTypes", "objectClasses"])
+            .context("schema read")?
+            .success().context("schema read rejected")?
+            .0.into_iter().next().map(SearchEntry::construct)
+            .context("no subschema entry")?;
+
+        let mut out = Vec::new();
+        for raw in entry.attrs.get("attributeTypes").cloned().unwrap_or_default() {
+            out.push(parse_schema_elem(&raw, SchemaKind::Attribute));
+        }
+        for raw in entry.attrs.get("objectClasses").cloned().unwrap_or_default() {
+            out.push(parse_schema_elem(&raw, SchemaKind::ObjectClass));
+        }
+        out.sort_by_key(|e| e.name.to_lowercase());
+        Ok(out)
     }
 
     /// How this client reached the directory (direct vs SSH tunnel), for the UI.
@@ -843,6 +892,25 @@ impl LdapClient {
 }
 
 // ---------- helpers ---------------------------------------------------------
+
+/// Parse an RFC 4512 schema definition string into a [`SchemaElem`] — enough to list
+/// and identify it (OID + primary NAME); the full string is kept in `raw`.
+/// `( 2.5.4.3 NAME 'cn' SUP name … )` or `( … NAME ( 'x' 'y' ) … )`.
+fn parse_schema_elem(raw: &str, kind: SchemaKind) -> SchemaElem {
+    let oid = raw.trim_start().trim_start_matches('(')
+        .split_whitespace().next().unwrap_or("").to_string();
+    let name = schema_name(raw).unwrap_or_else(|| oid.clone());
+    SchemaElem { kind, name, oid, raw: raw.trim().to_string() }
+}
+
+/// The first NAME value of a schema definition, if any.
+fn schema_name(raw: &str) -> Option<String> {
+    let after = raw.split(" NAME ").nth(1)?.trim_start();
+    // NAME 'x'  or  NAME ( 'x' 'y' )
+    let quoted = after.strip_prefix('(').map(str::trim_start).unwrap_or(after);
+    let inner = quoted.strip_prefix('\'')?;
+    inner.split('\'').next().map(str::to_string)
+}
 
 /// Detect the server brand from the rootDSE (`objectClass` / `vendorName`).
 /// Best-effort — undetectable servers are [`Brand::Other`].
